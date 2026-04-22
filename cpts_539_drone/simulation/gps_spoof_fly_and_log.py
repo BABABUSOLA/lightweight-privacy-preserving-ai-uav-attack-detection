@@ -154,6 +154,14 @@ Examples:
         logger.error(f"Unexpected error during connection: {e}", exc_info=True)
         return
 
+    # Policy: only log successful flight runs (no ground-only logging).
+    if not args.do_takeoff:
+        logger.warning(
+            "Takeoff not requested (--do-takeoff not set); skipping CSV logging "
+            "because this run did not execute a flight."
+        )
+        return
+
     # Try to arm/takeoff if requested
     took_off = await utils.maybe_arm_and_takeoff(drone, args.do_takeoff, verbose=True)
     if args.do_takeoff and not took_off and not args.debug_log_on_fail:

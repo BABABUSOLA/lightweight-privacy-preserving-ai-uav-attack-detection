@@ -8,56 +8,12 @@ from pathlib import Path
 from typing import Tuple
 
 from mavsdk import System
-from mavsdk.action import ActionError
 from mavsdk.mission import MissionItem, MissionPlan
 
+import config
+import utils
 
-def meters_to_lat_offset(meters: float) -> float:
-    return meters / 111_111.0
-
-
-def meters_to_lon_offset(meters: float, lat_deg: float) -> float:
-    return meters / (111_111.0 * math.cos(math.radians(lat_deg)))
-
-
-async def wait_for_connection(drone: System, timeout_s: float = 20.0) -> None:
-    print("Waiting for drone connection...")
-    start = time.time()
-    while True:
-        try:
-            async for state in drone.core.connection_state():
-                if state.is_connected:
-                    print("Connected to drone.")
-                    return
-        except RuntimeError as e:
-            if "Core plugin has not been initialized" not in str(e):
-                raise
-        if time.time() - start > timeout_s:
-            raise TimeoutError("Timed out waiting for drone connection.")
-        await asyncio.sleep(0.2)
-
-
-async def wait_for_health(drone: System, timeout_s: float = 30.0) -> None:
-    print("Waiting for global/home position estimate...")
-    start = time.time()
-    async for health in drone.telemetry.health():
-        if health.is_global_position_ok and health.is_home_position_ok:
-            print("Health checks passed.")
-            return
-        if time.time() - start > timeout_s:
-            raise TimeoutError("Timed out waiting for global/home position OK.")
-        await asyncio.sleep(1)
-
-
-async def get_home_latlon(drone: System, timeout_s: float = 15.0) -> Tuple[float, float]:
-    start = time.time()
-    async for p in drone.telemetry.position():
-        if p.latitude_deg != 0.0 or p.longitude_deg != 0.0:
-            return (p.latitude_deg, p.longitude_deg)
-        if time.time() - start > timeout_s:
-            raise TimeoutError("Timed out waiting for non-zero GPS position.")
-        await asyncio.sleep(0.1)
-    raise TimeoutError("No position stream received.")
+logger = utils.setup_logging(__name__)
 
 
 def build_circle_mission(
@@ -68,13 +24,14 @@ def build_circle_mission(
     cruise_speed_m_s: float,
     num_points: int,
 ) -> MissionPlan:
+    """Build a circle mission with evenly spaced waypoints."""
     items = []
     for i in range(num_points):
         ang = 2.0 * math.pi * (i / num_points)
         north_m = radius_m * math.cos(ang)
         east_m = radius_m * math.sin(ang)
-        lat = origin_lat + meters_to_lat_offset(north_m)
-        lon = origin_lon + meters_to_lon_offset(east_m, origin_lat)
+        lat = origin_lat + utils.meters_to_lat_offset(north_m)
+        lon = origin_lon + utils.meters_to_lon_offset(east_m, origin_lat)
         items.append(
             MissionItem(
                 vehicle_action=MissionItem.VehicleAction.NONE,
@@ -93,7 +50,45 @@ def build_circle_mission(
                 camera_photo_distance_m=float("nan"),
             )
         )
-    return MissionPlan(items)
+    plan = MissionPlan(items)
+    plan.mission_items = items
+    return plan
+
+
+async def get_home_latlon(
+    drone: System, timeout_s: float = 15.0
+) -> Tuple[float, float]:
+    """Get initial GPS position for mission origin."""
+    start = time.time()
+    async for p in drone.telemetry.position():
+        if p.latitude_deg != 0.0 or p.longitude_deg != 0.0:
+            return (p.latitude_deg, p.longitude_deg)
+        if time.time() - start > timeout_s:
+            msg = f"No valid GPS position within {timeout_s}s"
+            logger.error(msg)
+            raise TimeoutError(msg)
+        await asyncio.sleep(0.1)
+    msg = "Position stream ended without data"
+    logger.error(msg)
+    raise TimeoutError(msg)
+
+
+def validate_args(args) -> None:
+    """Validate command-line arguments."""
+    if args.duration <= 0:
+        raise ValueError("--duration must be positive")
+    if args.rate <= 0:
+        raise ValueError("--rate must be positive")
+    if args.rate > 1000:
+        logger.warning("--rate > 1000 Hz may cause performance issues")
+    if args.mission_radius_m <= 0:
+        raise ValueError("--mission-radius-m must be positive")
+    if args.mission_alt_m < 0:
+        raise ValueError("--mission-alt-m must be non-negative")
+    if args.cruise_speed_mps <= 0:
+        raise ValueError("--cruise-speed-mps must be positive")
+    if args.num_points < 3:
+        raise ValueError("--num-points must be >= 3")
 
 
 async def main() -> None:
@@ -102,34 +97,85 @@ async def main() -> None:
     )
     parser.add_argument(
         "--system-address",
-        default="udpin://0.0.0.0:14540",
-        help="MAVSDK system address (PX4 SITL default: udpin://0.0.0.0:14540)",
+        default=config.DEFAULT_SYSTEM_ADDRESS,
+        help="MAVSDK system address",
     )
-    parser.add_argument("--output-dir", default=None, help="Override output directory (default: data/normal_flights/raw)")
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help=f"Override output directory (default: {config.DEFAULT_LOG_DIR})",
+    )
     parser.add_argument("--scenario", default="circle", help="Scenario label for this run")
     parser.add_argument("--run-id", default="01", help="Run identifier (e.g., 01, 02)")
-    parser.add_argument("--duration", type=float, default=90.0, help="Logging duration in seconds")
-    parser.add_argument("--rate", type=float, default=10.0, help="Logging rate (Hz)")
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=config.DEFAULT_LOGGING_DURATION_S,
+        help="Logging duration in seconds",
+    )
+    parser.add_argument(
+        "--rate",
+        type=float,
+        default=config.DEFAULT_LOGGING_RATE_HZ,
+        help="Logging rate (Hz)",
+    )
     parser.add_argument("--do-takeoff", action="store_true", help="If set, arm + fly the mission")
+    parser.add_argument(
+        "--debug-log-on-fail",
+        action="store_true",
+        help=(
+            "If set, still write CSV telemetry even when --do-takeoff is requested "
+            "but mission start fails."
+        ),
+    )
     parser.add_argument("--mission-radius-m", type=float, default=15.0, help="Circle radius (meters)")
     parser.add_argument("--mission-alt-m", type=float, default=10.0, help="Relative altitude (meters)")
     parser.add_argument("--cruise-speed-mps", type=float, default=4.0, help="Mission cruise speed (m/s)")
     parser.add_argument("--num-points", type=int, default=12, help="Waypoints around the circle")
     args = parser.parse_args()
 
+    try:
+        validate_args(args)
+    except ValueError as e:
+        logger.error(f"Invalid arguments: {e}")
+        parser.print_help()
+        return
+
     if args.output_dir:
         raw_dir = Path(args.output_dir)
     else:
-        raw_dir = Path("data") / "normal_flights" / "raw"
+        raw_dir = Path(config.DEFAULT_LOG_DIR)
     raw_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = raw_dir / f"{args.scenario}_run{args.run_id}_{ts}.csv"
 
+    logger.info(f"Scenario: {args.scenario}, Run: {args.run_id}")
+    logger.info(f"Duration: {args.duration}s, Rate: {args.rate} Hz")
+    logger.info(
+        f"Mission: {args.mission_radius_m}m circle @ "
+        f"{args.mission_alt_m}m altitude, {args.cruise_speed_mps} m/s cruise"
+    )
+    logger.info(f"Output: {out_path}")
+
     drone = System()
-    await drone.connect(system_address=args.system_address)
-    await wait_for_connection(drone)
-    await wait_for_health(drone)
-    origin_lat, origin_lon = await get_home_latlon(drone)
+    try:
+        await drone.connect(system_address=args.system_address)
+        logger.info(f"Connecting to {args.system_address}...")
+    except Exception as e:
+        logger.error(f"Failed to initiate connection: {e}", exc_info=True)
+        return
+
+    try:
+        await utils.wait_for_connection(drone, verbose=True)
+        await utils.wait_for_health(drone, verbose=True)
+        origin_lat, origin_lon = await get_home_latlon(drone)
+        logger.info(f"Mission origin: {origin_lat:.6f}, {origin_lon:.6f}")
+    except TimeoutError as e:
+        logger.error(str(e))
+        return
+    except Exception as e:
+        logger.error(f"Error during preflight: {e}", exc_info=True)
+        return
 
     latest = {
         "lat_deg": None,
@@ -149,62 +195,63 @@ async def main() -> None:
         "battery_voltage_v": None,
     }
 
-    async def read_position():
-        async for p in drone.telemetry.position():
-            latest["lat_deg"] = p.latitude_deg
-            latest["lon_deg"] = p.longitude_deg
-            latest["abs_alt_m"] = p.absolute_altitude_m
-            latest["rel_alt_m"] = p.relative_altitude_m
-
     async def read_velocity():
         async for v in drone.telemetry.velocity_ned():
             latest["vel_n_m_s"] = v.north_m_s
             latest["vel_e_m_s"] = v.east_m_s
             latest["vel_d_m_s"] = v.down_m_s
 
-    async def read_imu():
-        async for imu in drone.telemetry.imu():
-            latest["accel_x_mps2"] = imu.acceleration_frd.forward_m_s2
-            latest["accel_y_mps2"] = imu.acceleration_frd.right_m_s2
-            latest["accel_z_mps2"] = imu.acceleration_frd.down_m_s2
-            latest["gyro_x_rps"] = imu.angular_velocity_frd.forward_rad_s
-            latest["gyro_y_rps"] = imu.angular_velocity_frd.right_rad_s
-            latest["gyro_z_rps"] = imu.angular_velocity_frd.down_rad_s
-
-    async def read_battery():
-        async for b in drone.telemetry.battery():
-            latest["battery_remaining_pct"] = b.remaining_percent
-            latest["battery_voltage_v"] = getattr(b, "voltage_v", None)
-
     tasks = [
-        asyncio.create_task(read_position()),
+        asyncio.create_task(utils.read_position(drone, latest)),
         asyncio.create_task(read_velocity()),
-        asyncio.create_task(read_imu()),
-        asyncio.create_task(read_battery()),
+        asyncio.create_task(utils.read_imu(drone, latest)),
+        asyncio.create_task(utils.read_battery(drone, latest)),
     ]
 
     flew_mission = False
+    row_count = 0
     try:
-        if args.do_takeoff:
-            print("Uploading circle mission...")
-            plan = build_circle_mission(
-                origin_lat=origin_lat,
-                origin_lon=origin_lon,
-                radius_m=args.mission_radius_m,
-                rel_alt_m=args.mission_alt_m,
-                cruise_speed_m_s=args.cruise_speed_mps,
-                num_points=args.num_points,
+        if not args.do_takeoff:
+            logger.warning(
+                "Takeoff not requested (--do-takeoff not set); skipping CSV logging "
+                "because this run did not execute a flight."
             )
-            await drone.mission.set_return_to_launch_after_mission(True)
-            await drone.mission.upload_mission(plan)
+            return
 
-            print("Arming...")
-            await drone.action.arm()
-            print("Starting mission...")
-            await drone.mission.start_mission()
-            flew_mission = True
-        else:
-            print("DO_TAKEOFF is False: skipping arming/mission. Logging only.")
+        if args.do_takeoff:
+            try:
+                logger.info("Building circle mission...")
+                plan = build_circle_mission(
+                    origin_lat=origin_lat,
+                    origin_lon=origin_lon,
+                    radius_m=args.mission_radius_m,
+                    rel_alt_m=args.mission_alt_m,
+                    cruise_speed_m_s=args.cruise_speed_mps,
+                    num_points=args.num_points,
+                )
+                logger.info(
+                    f"Uploading mission with {len(plan.mission_items)} waypoints..."
+                )
+                await drone.mission.set_return_to_launch_after_mission(True)
+                await drone.mission.upload_mission(plan)
+
+                logger.info("Arming...")
+                await drone.action.arm()
+                logger.info("Starting mission...")
+                await drone.mission.start_mission()
+                flew_mission = True
+                logger.info("Mission started successfully")
+            except Exception as e:
+                if not args.debug_log_on_fail:
+                    logger.warning(
+                        f"Mission start failed: {e}. Skipping CSV logging. "
+                        "Use --debug-log-on-fail to capture telemetry for debugging."
+                    )
+                    return
+                logger.warning(
+                    f"Mission start failed: {e}. Debug override enabled; "
+                    "logging telemetry without successful flight."
+                )
 
         fieldnames = [
             "timestamp_unix_s",
@@ -214,7 +261,7 @@ async def main() -> None:
             *latest.keys(),
         ]
 
-        print(f"Logging for {args.duration:.1f}s at {args.rate:.1f} Hz -> {out_path}")
+        logger.info(f"Logging for {args.duration:.1f}s at {args.rate:.1f} Hz -> {out_path}")
         start = time.time()
         period = 1.0 / args.rate
 
@@ -232,26 +279,36 @@ async def main() -> None:
                         **latest,
                     }
                 )
+                row_count += 1
                 await asyncio.sleep(period)
 
-    except ActionError as e:
-        print(f"[WARN] MAVSDK action error: {e}")
+    except IOError as e:
+        logger.error(f"Failed to write CSV: {e}", exc_info=True)
+        return
     finally:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
         if flew_mission:
-            print("Landing...")
+            logger.info("Landing...")
             try:
                 await drone.action.land()
-                await asyncio.sleep(5)
-            except ActionError as e:
-                print(f"[WARN] Land failed: {e}")
+                await asyncio.sleep(config.SLEEP_DURING_LANDING_S)
+                logger.info("Landing complete.")
+            except Exception as e:
+                logger.warning(f"Land failed: {e}")
 
-    print("Done. Log saved.")
+    logger.info(f"Logged {row_count} rows to {out_path}")
+    utils.validate_csv_output(str(out_path), verbose=True)
+    logger.info(f"Circle mission flight logging complete: {row_count} samples")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
 

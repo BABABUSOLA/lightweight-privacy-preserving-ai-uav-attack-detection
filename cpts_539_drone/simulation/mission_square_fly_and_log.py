@@ -8,8 +8,7 @@ at a configurable rate.
 
 Usage:
     python3 mission_square_fly_and_log.py --scenario square --duration 120 --do-takeoff
-    python3 mission_square_fly_and_log.py --scenario square --duration 120 \\
-        --mission-size-m 50 --mission-alt-m 20 --cruise-speed-mps 5
+    python3 mission_square_fly_and_log.py --scenario square --duration 60 --mission-size-m 50 --mission-alt-m 20 --cruise-speed-mps 5
 """
 
 import argparse
@@ -165,6 +164,14 @@ Examples:
         "--do-takeoff", action="store_true", help="Arm and execute mission"
     )
     parser.add_argument(
+        "--debug-log-on-fail",
+        action="store_true",
+        help=(
+            "If set, still write CSV telemetry even when --do-takeoff is requested "
+            "but mission start fails."
+        ),
+    )
+    parser.add_argument(
         "--system-address",
         default=config.DEFAULT_SYSTEM_ADDRESS,
         help="MAVSDK system address",
@@ -293,6 +300,13 @@ Examples:
     ]
 
     try:
+        if not args.do_takeoff:
+            logger.warning(
+                "Takeoff not requested (--do-takeoff not set); skipping CSV logging "
+                "because this run did not execute a flight."
+            )
+            return
+
         if args.do_takeoff:
             # Build and upload mission
             try:
@@ -316,9 +330,16 @@ Examples:
                 flew_mission = True
                 logger.info("Mission started successfully")
             except Exception as e:
-                logger.warning(f"Mission start failed: {e}. Logging will continue.")
-        else:
-            logger.info("Takeoff disabled: logging telemetry only")
+                if not args.debug_log_on_fail:
+                    logger.warning(
+                        f"Mission start failed: {e}. Skipping CSV logging. "
+                        "Use --debug-log-on-fail to capture telemetry for debugging."
+                    )
+                    return
+                logger.warning(
+                    f"Mission start failed: {e}. Debug override enabled; "
+                    "logging telemetry without successful flight."
+                )
 
         # Main logging loop
         logger.info(f"Logging for {args.duration:.1f}s at {args.rate:.1f} Hz -> {out_path}")

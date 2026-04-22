@@ -14,12 +14,27 @@ Usage:
 
 import asyncio
 import collections
+import logging
 import time
 import numpy as np
 import torch
 import joblib
 import torch.nn as nn
 from datetime import datetime
+
+from mavsdk import System
+
+# ─────────────────────────────────────────────────
+# Logger
+# ─────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    )
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 # ─────────────────────────────────────────────────
 # 1. GRU Model Definition (must match training)
@@ -63,6 +78,8 @@ THRESHOLD = 0.9468           # your GRU 95th percentile threshold
 SEQ_LEN = 50                 # must match training
 SITL_ADDRESS = "udp://:14540"  # default PX4 SITL address
 ALERT_COOLDOWN = 5.0         # seconds between repeated alerts
+TIMEOUT_CONNECTION_S = 20.0
+TIMEOUT_HEALTH_S = 30.0
 
 
 # ─────────────────────────────────────────────────
@@ -72,13 +89,13 @@ def load_model():
     model = GRUAutoencoder(n_features=10, hidden_size=32, latent_size=16)
     model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
     model.eval()
-    print(f"[INIT] Model loaded from {MODEL_PATH}")
+    logger.info(f"[INIT] Model loaded from {MODEL_PATH}")
     return model
 
 
 def load_scaler():
     scaler = joblib.load(SCALER_PATH)
-    print(f"[INIT] Scaler loaded from {SCALER_PATH}")
+    logger.info(f"[INIT] Scaler loaded from {SCALER_PATH}")
     return scaler
 
 
@@ -116,7 +133,7 @@ class AlertManager:
         self.log_file = log_file
 
         # Create log file with header
-        with open(self.log_file, "w") as f:
+        with open(self.log_file, "w", encoding="utf-8", newline="") as f:
             f.write("timestamp,mse_error,threshold,is_anomaly,lat,lon,alt\n")
 
     def handle(self, is_anomaly, mse, lat, lon, alt):
@@ -125,7 +142,7 @@ class AlertManager:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
         # Log every check
-        with open(self.log_file, "a") as f:
+        with open(self.log_file, "a", encoding="utf-8", newline="") as f:
             f.write(f"{timestamp},{mse:.6f},{THRESHOLD:.6f},"
                     f"{int(is_anomaly)},{lat:.6f},{lon:.6f},{alt:.3f}\n")
 
@@ -187,6 +204,67 @@ latest = {
 }
 
 
+async def wait_for_connection(drone: System, timeout_s: float = TIMEOUT_CONNECTION_S) -> None:
+    """Wait for MAVSDK connection with timeout."""
+    start = time.time()
+    while True:
+        async for state in drone.core.connection_state():
+            if state.is_connected:
+                logger.info("[CONN] Drone connected!")
+                return
+
+        if time.time() - start > timeout_s:
+            raise TimeoutError(f"Timed out waiting for connection after {timeout_s}s")
+        await asyncio.sleep(0.2)
+
+
+async def wait_for_health(drone: System, timeout_s: float = TIMEOUT_HEALTH_S) -> None:
+    """Wait for global/home position readiness with timeout."""
+    start = time.time()
+    async for health in drone.telemetry.health():
+        if health.is_global_position_ok and health.is_home_position_ok:
+            logger.info("[CONN] GPS fix acquired!")
+            return
+        if time.time() - start > timeout_s:
+            raise TimeoutError(f"Timed out waiting for health after {timeout_s}s")
+        await asyncio.sleep(0.5)
+
+
+def _get_imu_axes(imu):
+    """
+    Return accel/gyro axes from whichever MAVSDK IMU layout is available.
+    Prefers FRD fields used in the rest of this project.
+    """
+    if hasattr(imu, "acceleration_frd") and hasattr(imu, "angular_velocity_frd"):
+        accel = imu.acceleration_frd
+        gyro = imu.angular_velocity_frd
+        return (
+            accel.forward_m_s2,
+            accel.right_m_s2,
+            accel.down_m_s2,
+            gyro.forward_rad_s,
+            gyro.right_rad_s,
+            gyro.down_rad_s,
+        )
+
+    # Fallback for older/alternate message layouts.
+    if hasattr(imu, "acceleration_fwd") and hasattr(imu, "angular_velocity_body"):
+        accel_x = imu.acceleration_fwd
+        accel_y = getattr(imu, "acceleration_right", 0.0)
+        accel_z = getattr(imu, "acceleration_down", 0.0)
+        body = imu.angular_velocity_body
+        return (
+            accel_x,
+            accel_y,
+            accel_z,
+            getattr(body, "roll_rad_s", 0.0),
+            getattr(body, "pitch_rad_s", 0.0),
+            getattr(body, "yaw_rad_s", 0.0),
+        )
+
+    raise AttributeError("Unsupported IMU schema received from MAVSDK telemetry")
+
+
 async def collect_position(drone):
     async for pos in drone.telemetry.position():
         latest["lat"] = pos.latitude_deg
@@ -196,12 +274,18 @@ async def collect_position(drone):
 
 async def collect_imu(drone):
     async for imu in drone.telemetry.imu():
-        latest["accel_x"] = imu.acceleration_fwd
-        latest["accel_y"] = imu.acceleration_right
-        latest["accel_z"] = imu.acceleration_down
-        latest["gyro_x"] = imu.angular_velocity_body.roll_rad_s
-        latest["gyro_y"] = imu.angular_velocity_body.pitch_rad_s
-        latest["gyro_z"] = imu.angular_velocity_body.yaw_rad_s
+        try:
+            (
+                latest["accel_x"],
+                latest["accel_y"],
+                latest["accel_z"],
+                latest["gyro_x"],
+                latest["gyro_y"],
+                latest["gyro_z"],
+            ) = _get_imu_axes(imu)
+        except AttributeError as e:
+            logger.warning(f"[DETECT] IMU mapping warning: {e}")
+            continue
         latest["ready"] = True  # IMU is the fastest stream
 
 
@@ -270,22 +354,14 @@ async def main():
     alert_mgr = AlertManager(cooldown=ALERT_COOLDOWN)
 
     # Connect to PX4 SITL
-    from mavsdk import System
     drone = System()
-    print(f"\n[CONN] Connecting to {SITL_ADDRESS}...")
+    logger.info(f"[CONN] Connecting to {SITL_ADDRESS}...")
     await drone.connect(system_address=SITL_ADDRESS)
-
-    print("[CONN] Waiting for drone to connect...")
-    async for state in drone.core.connection_state():
-        if state.is_connected:
-            print("[CONN] Drone connected!")
-            break
-
-    print("[CONN] Waiting for GPS fix...")
-    async for health in drone.telemetry.health():
-        if health.is_global_position_ok and health.is_home_position_ok:
-            print("[CONN] GPS fix acquired!\n")
-            break
+    logger.info("[CONN] Waiting for drone to connect...")
+    await wait_for_connection(drone)
+    logger.info("[CONN] Waiting for GPS fix...")
+    await wait_for_health(drone)
+    print("")
 
     # Start all tasks concurrently
     print("[START] Launching telemetry collectors + detection loop\n")
