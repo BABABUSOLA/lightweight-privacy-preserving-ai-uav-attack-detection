@@ -35,7 +35,7 @@ if not logger.handlers:
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
-PYTHON = "python3"  # or "python" depending on your VM
+PYTHON = sys.executable
 
 
 async def _wait_for_hold_state_async(

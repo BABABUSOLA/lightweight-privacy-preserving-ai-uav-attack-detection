@@ -84,7 +84,10 @@ def meters_to_lat_offset(meters: float) -> float:
 
 def meters_to_lon_offset(meters: float, lat_deg: float) -> float:
     """Convert an east/west displacement in metres to a longitude offset in degrees."""
-    return meters / (111_111.0 * math.cos(math.radians(lat_deg)))
+    cos_lat = math.cos(math.radians(lat_deg))
+    if abs(cos_lat) < 0.001:
+        return 0.0
+    return meters / (111_111.0 * cos_lat)
 
 
 # ---------------------------------------------------------------------------

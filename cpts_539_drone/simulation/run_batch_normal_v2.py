@@ -15,8 +15,10 @@ Usage:
 from __future__ import annotations
 
 import logging
+import csv
 import subprocess
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -33,7 +35,7 @@ if not logger.handlers:
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
-PYTHON = "python3"  # or "python" depending on your VM
+PYTHON = sys.executable
 
 # ---------------------------------------------------------------------------
 # Scenario configs
@@ -147,6 +149,38 @@ def run_subprocess(
         return False
 
 
+def find_latest_csv_since(log_dir: Path, start_time_s: float) -> Path | None:
+    """Return latest CSV modified at/after start_time_s in log_dir."""
+    if not log_dir.exists():
+        return None
+
+    candidates: list[Path] = []
+    for path in log_dir.glob("*.csv"):
+        try:
+            if path.stat().st_mtime >= start_time_s:
+                candidates.append(path)
+        except OSError:
+            continue
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def csv_has_data_rows(csv_path: Path) -> bool:
+    """Return True if CSV contains header and at least one data row."""
+    try:
+        with csv_path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            next(reader, None)
+            first_data_row = next(reader, None)
+            return first_data_row is not None
+    except Exception as e:
+        logger.error(f"Failed to validate CSV file {csv_path}: {e}")
+        logger.error(traceback.format_exc())
+        return False
+
+
 def main() -> bool:
     """Main batch runner with scenario matrix."""
     logger.info("="*70)
@@ -155,6 +189,7 @@ def main() -> bool:
 
     base_cmd = [PYTHON, "simulation/fly_and_log.py"]
     failed_runs: list[str] = []
+    log_dir = Path(config.DEFAULT_LOG_DIR)
 
     # Calculate total runs for progress tracking
     total_runs = sum(int(get(s, "runs")) for s in SCENARIOS)
@@ -200,7 +235,19 @@ def main() -> bool:
             logger.info(f"{'='*70}")
 
             # Run scenario
+            run_start_s = time.time()
             success = run_subprocess(cmd, tag=tag)
+
+            if success:
+                latest_csv = find_latest_csv_since(log_dir=log_dir, start_time_s=run_start_s)
+                if latest_csv is None:
+                    logger.error(f"[{tag}] No CSV file created in {log_dir} after run start.")
+                    success = False
+                elif not csv_has_data_rows(latest_csv):
+                    logger.error(f"[{tag}] CSV has no data rows (or is unreadable): {latest_csv}")
+                    success = False
+                else:
+                    logger.info(f"[{tag}] Output validated: {latest_csv}")
             if success:
                 completed += 1
             else:

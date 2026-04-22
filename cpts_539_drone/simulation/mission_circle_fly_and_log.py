@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import csv
 import math
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -91,7 +92,7 @@ def validate_args(args) -> None:
         raise ValueError("--num-points must be >= 3")
 
 
-async def main() -> None:
+async def main() -> int:
     parser = argparse.ArgumentParser(
         description="Fly a small circle mission in PX4 SITL and log telemetry to CSV."
     )
@@ -139,7 +140,7 @@ async def main() -> None:
     except ValueError as e:
         logger.error(f"Invalid arguments: {e}")
         parser.print_help()
-        return
+        return 1
 
     if args.output_dir:
         raw_dir = Path(args.output_dir)
@@ -148,6 +149,7 @@ async def main() -> None:
     raw_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = raw_dir / f"{args.scenario}_run{args.run_id}_{ts}.csv"
+    out_tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
 
     logger.info(f"Scenario: {args.scenario}, Run: {args.run_id}")
     logger.info(f"Duration: {args.duration}s, Rate: {args.rate} Hz")
@@ -163,7 +165,7 @@ async def main() -> None:
         logger.info(f"Connecting to {args.system_address}...")
     except Exception as e:
         logger.error(f"Failed to initiate connection: {e}", exc_info=True)
-        return
+        return 1
 
     try:
         await utils.wait_for_connection(drone, verbose=True)
@@ -172,10 +174,10 @@ async def main() -> None:
         logger.info(f"Mission origin: {origin_lat:.6f}, {origin_lon:.6f}")
     except TimeoutError as e:
         logger.error(str(e))
-        return
+        return 1
     except Exception as e:
         logger.error(f"Error during preflight: {e}", exc_info=True)
-        return
+        return 1
 
     latest = {
         "lat_deg": None,
@@ -210,13 +212,15 @@ async def main() -> None:
 
     flew_mission = False
     row_count = 0
+    logging_ok = False
+    landing_ok = False
     try:
         if not args.do_takeoff:
             logger.warning(
                 "Takeoff not requested (--do-takeoff not set); skipping CSV logging "
                 "because this run did not execute a flight."
             )
-            return
+            return 1
 
         if args.do_takeoff:
             try:
@@ -247,7 +251,7 @@ async def main() -> None:
                         f"Mission start failed: {e}. Skipping CSV logging. "
                         "Use --debug-log-on-fail to capture telemetry for debugging."
                     )
-                    return
+                    return 1
                 logger.warning(
                     f"Mission start failed: {e}. Debug override enabled; "
                     "logging telemetry without successful flight."
@@ -261,11 +265,11 @@ async def main() -> None:
             *latest.keys(),
         ]
 
-        logger.info(f"Logging for {args.duration:.1f}s at {args.rate:.1f} Hz -> {out_path}")
+        logger.info(f"Logging for {args.duration:.1f}s at {args.rate:.1f} Hz -> {out_tmp_path}")
         start = time.time()
         period = 1.0 / args.rate
 
-        with out_path.open("w", newline="", encoding="utf-8") as f:
+        with out_tmp_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             while (time.time() - start) < args.duration:
@@ -281,10 +285,10 @@ async def main() -> None:
                 )
                 row_count += 1
                 await asyncio.sleep(period)
+        logging_ok = row_count > 0
 
     except IOError as e:
         logger.error(f"Failed to write CSV: {e}", exc_info=True)
-        return
     finally:
         for t in tasks:
             t.cancel()
@@ -294,21 +298,53 @@ async def main() -> None:
             logger.info("Landing...")
             try:
                 await drone.action.land()
-                await asyncio.sleep(config.SLEEP_DURING_LANDING_S)
-                logger.info("Landing complete.")
+                landing_ok = await utils.wait_for_landed_hold_state(
+                    drone,
+                    timeout_s=max(config.SLEEP_DURING_LANDING_S, 20.0),
+                    poll_s=1.0,
+                    verbose=True,
+                )
+                if landing_ok:
+                    logger.info("Landing complete and verified.")
             except Exception as e:
                 logger.warning(f"Land failed: {e}")
+                landing_ok = False
 
-    logger.info(f"Logged {row_count} rows to {out_path}")
-    utils.validate_csv_output(str(out_path), verbose=True)
-    logger.info(f"Circle mission flight logging complete: {row_count} samples")
+    if not logging_ok:
+        logger.error("Run failed: telemetry logging did not complete successfully.")
+    if not landing_ok:
+        logger.error("Run failed: landing was not confirmed.")
+
+    csv_ok = logging_ok and utils.validate_csv_output(str(out_tmp_path), verbose=True)
+    if not csv_ok:
+        logger.error("Run failed: temporary CSV validation did not pass.")
+
+    if logging_ok and landing_ok and csv_ok:
+        try:
+            out_tmp_path.replace(out_path)
+            logger.info(f"Logged {row_count} rows to {out_path}")
+            logger.info(f"Circle mission flight logging complete: {row_count} samples")
+            return 0
+        except Exception as e:
+            logger.error(f"Failed to promote temp CSV to final output: {e}", exc_info=True)
+
+    try:
+        if out_tmp_path.exists():
+            out_tmp_path.unlink()
+            logger.info(f"Deleted temporary CSV due to failed run: {out_tmp_path}")
+    except Exception as e:
+        logger.warning(f"Failed to delete temporary CSV {out_tmp_path}: {e}")
+    return 1
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        rc = asyncio.run(main())
+        sys.exit(rc)
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
 

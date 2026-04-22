@@ -19,6 +19,11 @@ import config
 logger = logging.getLogger(__name__)
 
 
+def _safe_anext(awaitable, timeout_s: float):
+    """Read one async stream item with timeout."""
+    return asyncio.wait_for(anext(awaitable), timeout=timeout_s)
+
+
 # ============================================================================
 # Connection & Health Checks (WITH TIMEOUT GUARDS)
 # ============================================================================
@@ -47,7 +52,6 @@ async def wait_for_connection(
         print(f"Waiting for drone connection (timeout={timeout_s}s)...")
 
     start_time = time.time()
-    last_error = None
 
     while True:
         elapsed = time.time() - start_time
@@ -60,23 +64,22 @@ async def wait_for_connection(
             raise TimeoutError(msg)
 
         try:
-            async for state in drone.core.connection_state():
-                if state.is_connected:
-                    if verbose:
-                        print(f"Connected to drone (elapsed={elapsed:.1f}s).")
-                    logger.info("Drone connected successfully.")
-                    return
-                # Not connected yet, continue loop
+            state = await _safe_anext(
+                drone.core.connection_state(), timeout_s=config.SLEEP_CONNECTION_LOOP_S
+            )
+            if state.is_connected:
+                if verbose:
+                    print(f"Connected to drone (elapsed={elapsed:.1f}s).")
+                logger.info("Drone connected successfully.")
+                return
+        except asyncio.TimeoutError:
+            pass
         except RuntimeError as e:
             error_str = str(e)
             # Only suppress this specific expected error during initialization
             if "Core plugin has not been initialized" not in error_str:
-                last_error = e
                 logger.debug(f"Connection error (non-fatal): {e}")
-            await asyncio.sleep(config.SLEEP_CONNECTION_LOOP_S)
-            continue
         except Exception as e:
-            last_error = e
             logger.error(f"Unexpected error during connection check: {e}", exc_info=True)
             raise
 
@@ -214,6 +217,57 @@ async def maybe_arm_and_takeoff(
         return False
 
 
+async def wait_for_landed_hold_state(
+    drone: System,
+    timeout_s: float = 30.0,
+    poll_s: float = 1.0,
+    verbose: bool = True,
+) -> bool:
+    """
+    Wait until the vehicle is safely landed and stabilized.
+
+    Success condition:
+        - flight mode is HOLD
+        - armed is False
+        - in_air is False
+    """
+    start = time.time()
+    while (time.time() - start) < timeout_s:
+        try:
+            mode = await asyncio.wait_for(anext(drone.telemetry.flight_mode()), timeout=poll_s)
+            armed = await asyncio.wait_for(anext(drone.telemetry.armed()), timeout=poll_s)
+            in_air = await asyncio.wait_for(anext(drone.telemetry.in_air()), timeout=poll_s)
+        except asyncio.TimeoutError:
+            if verbose:
+                print("Waiting for landing telemetry...")
+            await asyncio.sleep(poll_s)
+            continue
+        except Exception as e:
+            logger.warning(f"Landing gate telemetry read failed: {e}")
+            await asyncio.sleep(poll_s)
+            continue
+
+        mode_name = getattr(mode, "name", str(mode))
+        if mode_name == "HOLD" and (armed is False) and (in_air is False):
+            if verbose:
+                print("Landing gate passed: HOLD + disarmed + on-ground.")
+            logger.info("Landing gate passed.")
+            return True
+
+        if verbose:
+            print(
+                f"Landing gate pending: mode={mode_name}, "
+                f"armed={armed}, in_air={in_air}"
+            )
+        await asyncio.sleep(poll_s)
+
+    logger.error(
+        "Landing gate timeout: vehicle did not reach HOLD/disarmed/on-ground state "
+        f"within {timeout_s:.1f}s."
+    )
+    return False
+
+
 # ============================================================================
 # Telemetry Streaming Helpers
 # ============================================================================
@@ -301,7 +355,7 @@ def meters_to_lon_offset(meters: float, latitude_deg: float) -> float:
     """
     lat_rad = math.radians(latitude_deg)
     cos_lat = math.cos(lat_rad)
-    if cos_lat < 0.001:  # Avoid division by zero near poles
+    if abs(cos_lat) < 0.001:  # Avoid division by zero near poles
         return 0.0
     return meters / (config.METERS_PER_DEGREE_LON_AT_EQUATOR * cos_lat)
 

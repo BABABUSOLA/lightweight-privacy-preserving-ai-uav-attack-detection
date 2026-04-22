@@ -21,6 +21,7 @@ import asyncio
 import csv
 import logging
 import math
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -34,7 +35,7 @@ import utils
 logger = utils.setup_logging(__name__)
 
 
-async def main() -> None:
+async def main() -> int:
     """Main GPS-spoofing flight logger coroutine."""
     parser = argparse.ArgumentParser(
         description="Log flight telemetry with optional GPS spoofing.",
@@ -109,11 +110,11 @@ Examples:
     if args.duration <= 0 or args.rate <= 0:
         logger.error("Duration and rate must be positive")
         parser.print_help()
-        return
+        return 1
 
     if args.attack_start < 0:
         logger.error("attack-start must be non-negative")
-        return
+        return 1
 
     if args.attack_start >= args.duration:
         logger.warning("attack-start >= duration; spoofing never begins")
@@ -126,6 +127,7 @@ Examples:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_name = f"flight_{ts}.csv"
     out_path = raw_dir / out_name
+    out_tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
 
     logger.info(f"Scenario: {args.scenario}, Run: {args.run_id}")
     logger.info(f"Duration: {args.duration}s, Rate: {args.rate} Hz")
@@ -142,17 +144,17 @@ Examples:
         logger.info(f"Connecting to {args.system_address}...")
     except Exception as e:
         logger.error(f"Failed to initiate connection: {e}", exc_info=True)
-        return
+        return 1
 
     # Wait for connection with timeout
     try:
         await utils.wait_for_connection(drone, verbose=True)
     except TimeoutError as e:
         logger.error(str(e))
-        return
+        return 1
     except Exception as e:
         logger.error(f"Unexpected error during connection: {e}", exc_info=True)
-        return
+        return 1
 
     # Policy: only log successful flight runs (no ground-only logging).
     if not args.do_takeoff:
@@ -160,7 +162,7 @@ Examples:
             "Takeoff not requested (--do-takeoff not set); skipping CSV logging "
             "because this run did not execute a flight."
         )
-        return
+        return 1
 
     # Try to arm/takeoff if requested
     took_off = await utils.maybe_arm_and_takeoff(drone, args.do_takeoff, verbose=True)
@@ -169,7 +171,7 @@ Examples:
             "Takeoff was requested but arm/takeoff failed; skipping CSV logging. "
             "Use --debug-log-on-fail to capture disarmed telemetry for debugging."
         )
-        return
+        return 1
 
     # Initialize telemetry snapshot dict
     latest = {
@@ -224,14 +226,16 @@ Examples:
 
     # Main logging loop
     print(
-        f"Logging {args.duration:.0f}s @ {args.rate:.0f} Hz -> {out_path}"
+        f"Logging {args.duration:.0f}s @ {args.rate:.0f} Hz -> {out_tmp_path}"
     )
     start = time.time()
     period = 1.0 / args.rate
     row_count = 0
+    logging_ok = False
+    landing_ok = False
 
     try:
-        with out_path.open("w", newline="", encoding="utf-8") as f:
+        with out_tmp_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
 
@@ -285,10 +289,10 @@ Examples:
                 writer.writerow(row)
                 row_count += 1
                 await asyncio.sleep(period)
+        logging_ok = row_count > 0
 
     except IOError as e:
         logger.error(f"Failed to write CSV: {e}", exc_info=True)
-        return
     finally:
         # Gracefully shutdown telemetry tasks
         for t in tasks:
@@ -300,24 +304,55 @@ Examples:
             print("Landing...")
             try:
                 await drone.action.land()
-                await asyncio.sleep(config.SLEEP_DURING_LANDING_S)
-                logger.info("Landing complete.")
+                landing_ok = await utils.wait_for_landed_hold_state(
+                    drone,
+                    timeout_s=max(config.SLEEP_DURING_LANDING_S, 20.0),
+                    poll_s=1.0,
+                    verbose=True,
+                )
+                if landing_ok:
+                    logger.info("Landing complete and verified.")
             except Exception as e:
                 logger.warning(f"Land failed: {e}")
+                landing_ok = False
 
-    # Validate output
-    print(f"Logged {row_count} rows to {out_path}")
-    utils.validate_csv_output(str(out_path), verbose=True)
-    logger.info(f"GPS spoof flight logging complete: {row_count} samples")
+    if not logging_ok:
+        logger.error("Run failed: telemetry logging did not complete successfully.")
+    if not landing_ok:
+        logger.error("Run failed: landing was not confirmed.")
+
+    csv_ok = logging_ok and utils.validate_csv_output(str(out_tmp_path), verbose=True)
+    if not csv_ok:
+        logger.error("Run failed: temporary CSV validation did not pass.")
+
+    if logging_ok and landing_ok and csv_ok:
+        try:
+            out_tmp_path.replace(out_path)
+            print(f"Logged {row_count} rows to {out_path}")
+            logger.info(f"GPS spoof flight logging complete: {row_count} samples")
+            return 0
+        except Exception as e:
+            logger.error(f"Failed to promote temp CSV to final output: {e}", exc_info=True)
+
+    try:
+        if out_tmp_path.exists():
+            out_tmp_path.unlink()
+            logger.info(f"Deleted temporary CSV due to failed run: {out_tmp_path}")
+    except Exception as e:
+        logger.warning(f"Failed to delete temporary CSV {out_tmp_path}: {e}")
+    return 1
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        rc = asyncio.run(main())
+        sys.exit(rc)
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
 
 '''
 # Gradual drift: 1.5 m/s northeast starting at t=10s, log for 60s
