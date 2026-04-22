@@ -70,6 +70,14 @@ Examples:
         "--do-takeoff", action="store_true", help="Arm and takeoff before logging"
     )
     parser.add_argument(
+        "--debug-log-on-fail",
+        action="store_true",
+        help=(
+            "If set, still write CSV telemetry even when --do-takeoff is requested "
+            "but arm/takeoff fails."
+        ),
+    )
+    parser.add_argument(
         "--system-address",
         default=config.DEFAULT_SYSTEM_ADDRESS,
         help="MAVSDK system address",
@@ -148,6 +156,12 @@ Examples:
 
     # Try to arm/takeoff if requested
     took_off = await utils.maybe_arm_and_takeoff(drone, args.do_takeoff, verbose=True)
+    if args.do_takeoff and not took_off and not args.debug_log_on_fail:
+        logger.warning(
+            "Takeoff was requested but arm/takeoff failed; skipping CSV logging. "
+            "Use --debug-log-on-fail to capture disarmed telemetry for debugging."
+        )
+        return
 
     # Initialize telemetry snapshot dict
     latest = {
@@ -296,10 +310,6 @@ if __name__ == "__main__":
         logger.info("Interrupted by user")
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
 
 '''
 # Gradual drift: 1.5 m/s northeast starting at t=10s, log for 60s
