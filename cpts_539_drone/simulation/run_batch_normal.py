@@ -10,13 +10,17 @@ Usage:
     python3 run_batch_normal.py
 """
 
+import asyncio
 import logging
 import subprocess
 import sys
+import time
 import traceback
-from pathlib import Path
+
+from mavsdk import System
 
 import config
+import utils
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -30,6 +34,54 @@ if not logger.handlers:
     logger.addHandler(handler)
 
 PYTHON = "python3"  # or "python" depending on your VM
+
+
+async def _wait_for_hold_state_async(
+    system_address: str, timeout_s: float, poll_s: float
+) -> bool:
+    """Wait until vehicle reports HOLD mode while disarmed and on ground."""
+    drone = System()
+    await drone.connect(system_address=system_address)
+    await utils.wait_for_connection(drone, timeout_s=min(10.0, timeout_s), verbose=False)
+
+    start = time.time()
+    while (time.time() - start) < timeout_s:
+        mode = await asyncio.wait_for(anext(drone.telemetry.flight_mode()), timeout=poll_s)
+        armed = await asyncio.wait_for(anext(drone.telemetry.armed()), timeout=poll_s)
+        in_air = await asyncio.wait_for(anext(drone.telemetry.in_air()), timeout=poll_s)
+
+        mode_name = getattr(mode, "name", str(mode))
+        if mode_name == "HOLD" and (armed is False) and (in_air is False):
+            logger.info(
+                "Vehicle state gate passed: mode=HOLD, armed=False, in_air=False"
+            )
+            return True
+
+        logger.info(
+            f"Waiting for HOLD before next run... mode={mode_name}, "
+            f"armed={armed}, in_air={in_air}"
+        )
+        await asyncio.sleep(poll_s)
+
+    return False
+
+
+def wait_for_hold_state(
+    system_address: str, timeout_s: float = 30.0, poll_s: float = 1.0
+) -> bool:
+    """Synchronous wrapper for waiting on HOLD mode between runs."""
+    try:
+        return asyncio.run(
+            _wait_for_hold_state_async(
+                system_address=system_address,
+                timeout_s=timeout_s,
+                poll_s=poll_s,
+            )
+        )
+    except Exception as e:
+        logger.error(f"HOLD state check failed with error: {e}")
+        logger.error(traceback.format_exc())
+        return False
 
 
 def run_subprocess(
@@ -137,6 +189,10 @@ def main():
         logger.info("Takeoff policy: NEVER")
 
     # Prepare batch runs
+    hold_wait_timeout_s = 30.0
+    hold_wait_poll_s = 1.0
+    hold_check_address = config.DEFAULT_SYSTEM_ADDRESS
+
     total_runs = len(scenarios) * runs_per_scenario
     completed = 0
     failed = []
@@ -180,6 +236,22 @@ def main():
 
             # Run scenario
             success = run_subprocess(cmd, tag=tag)
+
+            # Post-run gate: ensure vehicle has stabilized in HOLD before next run
+            if success and do_takeoff:
+                logger.info(f"[{tag}] Checking vehicle HOLD status before next run...")
+                hold_ok = wait_for_hold_state(
+                    system_address=hold_check_address,
+                    timeout_s=hold_wait_timeout_s,
+                    poll_s=hold_wait_poll_s,
+                )
+                if not hold_ok:
+                    logger.error(
+                        f"[{tag}] Vehicle did not reach HOLD/disarmed/on-ground state "
+                        f"within {hold_wait_timeout_s:.1f}s."
+                    )
+                    success = False
+
             if success:
                 completed += 1
             else:
@@ -218,4 +290,3 @@ if __name__ == "__main__":
         logger.error(f"Fatal error: {e}")
         logger.error(traceback.format_exc())
         sys.exit(1)
-    # Ensure working dir is project root when calling this script
