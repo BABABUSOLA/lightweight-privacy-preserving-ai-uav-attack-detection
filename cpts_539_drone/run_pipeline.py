@@ -79,44 +79,44 @@ class SpoofedMissionStep:
 PIPELINE: list[object] = [
     # Step 1: Normal out-and-back mission
     Step(
-        name="Normal out-and-back fast mission",
+        name="Normal out-and-back high/fast mission",
         script="simulation/mission_out_back_fly_and_log.py",
         args=[
             "--scenario",
-            "out_back_fast_10s",
+            "out_back_high_fast",
             "--cruise-seconds",
             "10",
             "--cruise-speed-mps",
-            "12",
+            "16",
             "--mission-alt-m",
-            "12",
+            "25",
             "--do-takeoff",
         ],
-        runs=1
+        runs=1,
         inject_run_id=True,
     ),
     # Step 2: Real-time GPS spoofing on out-and-back mission
     Step(
-        name="Out-and-back real-time spoof (fast drift E)",
+        name="Out-and-back real-time spoof high/fast (fast drift E)",
         script="simulation/mission_out_back_gps_spoof_fly_and_log.py",
         args=[
             "--scenario",
-            "out_back_fast_10s_spoof",
+            "out_back_high_fast_spoof",
             "--cruise-seconds",
             "10",
             "--cruise-speed-mps",
-            "12",
+            "16",
             "--mission-alt-m",
-            "12",
+            "25",
             "--attack-start",
             "3",
             "--drift-rate-m-per-s",
-            "4.0",
+            "5.0",
             "--drift-direction-deg",
             "90",
             "--do-takeoff",
         ],
-        runs=1
+        runs=1,
         inject_run_id=True,
     ),
     # Step 3: Baseline spoofing (data-level): CSV-only drift (kept for reproducibility)
@@ -138,7 +138,7 @@ PIPELINE: list[object] = [
             "45",
             "--do-takeoff",
         ],
-        runs=1
+        runs=1,
         inject_run_id=True,
     ),
 ]

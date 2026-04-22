@@ -84,3 +84,70 @@ python3 cpts_539_drone/simulation/mission_out_back_gps_spoof_fly_and_log.py \
   - `90` = east
   - `180` = south
   - `270` = west
+
+## High and Fast Profile
+
+Use these commands to fly higher and faster than the default profile.
+
+Normal high/fast mission:
+
+```bash
+python3 cpts_539_drone/simulation/mission_out_back_fly_and_log.py \
+  --do-takeoff \
+  --scenario out_back_high_fast \
+  --run-id 01 \
+  --cruise-seconds 10 \
+  --cruise-speed-mps 16 \
+  --mission-alt-m 25 \
+  --output-dir data/normal_flights/raw
+```
+
+Attack high/fast mission (real-time spoof):
+
+```bash
+python3 cpts_539_drone/simulation/mission_out_back_gps_spoof_fly_and_log.py \
+  --do-takeoff \
+  --scenario out_back_high_fast_spoof \
+  --run-id 01 \
+  --cruise-seconds 10 \
+  --cruise-speed-mps 16 \
+  --mission-alt-m 25 \
+  --attack-start 3 \
+  --drift-rate-m-per-s 5.0 \
+  --drift-direction-deg 90 \
+  --output-dir data/attack_flights/raw
+```
+
+Recommended step-up sequence for stability in slower VMs:
+
+- Start with `--cruise-speed-mps 12 --mission-alt-m 12`
+- Then try `--cruise-speed-mps 14 --mission-alt-m 18`
+- Then try `--cruise-speed-mps 16 --mission-alt-m 25`
+
+## PX4 Battery Parameters in QGC (SITL)
+
+If your VM is slow or repeated runs fail to arm after battery drops, inspect
+battery failsafe settings in QGroundControl:
+
+- Open `Vehicle Setup -> Parameters`
+- Search for:
+  - `BAT_LOW_THR`
+  - `BAT_CRIT_THR`
+  - `BAT_EMERGEN_THR`
+  - `COM_LOW_BAT_ACT`
+
+Recommended SITL-safe ranges for repeated experiments:
+
+- `BAT_LOW_THR`: `0.20` to `0.25`
+- `BAT_CRIT_THR`: `0.12` to `0.15`
+- `BAT_EMERGEN_THR`: `0.07` to `0.10`
+- `COM_LOW_BAT_ACT`: least aggressive option (for example, warning-only)
+
+Keep thresholds ordered as:
+
+- `BAT_LOW_THR > BAT_CRIT_THR > BAT_EMERGEN_THR`
+
+For stable pipelines:
+
+- Start with fewer runs (`runs=1`), then increase to `runs=2` or `runs=3`
+- If needed, restart SITL between long experiment sets to reset battery state
