@@ -92,7 +92,7 @@ PIPELINE: list[object] = [
             "12",
             "--do-takeoff",
         ],
-        runs=3,
+        runs=1
         inject_run_id=True,
     ),
     # Step 2: Real-time GPS spoofing on out-and-back mission
@@ -116,7 +116,7 @@ PIPELINE: list[object] = [
             "90",
             "--do-takeoff",
         ],
-        runs=3,
+        runs=1
         inject_run_id=True,
     ),
     # Step 3: Baseline spoofing (data-level): CSV-only drift (kept for reproducibility)
@@ -138,7 +138,7 @@ PIPELINE: list[object] = [
             "45",
             "--do-takeoff",
         ],
-        runs=3,
+        runs=1
         inject_run_id=True,
     ),
 ]
