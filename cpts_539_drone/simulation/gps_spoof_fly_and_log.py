@@ -1,184 +1,212 @@
 """
 GPS Spoofing Flight Logger
 ===========================
-Logs telemetry from PX4 SITL.  After --attack-start seconds the *logged*
-GPS coordinates are offset by a drift that grows linearly, simulating a
-gradual GPS spoofing attack.
+Logs telemetry from PX4 SITL with optional GPS spoofing.
 
-IMU and battery values are always logged truthfully, so the resulting CSV
-contains a realistic GPS-vs-IMU inconsistency that the LSTM autoencoder
-should learn to detect.
+After --attack-start seconds, logged GPS coordinates are offset by a drift
+that grows linearly, simulating a gradual GPS spoofing attack.
 
-Columns marked "spoofed_*" contain the attacker-modified values.
-Columns "true_lat_deg" / "true_lon_deg" keep the real values for
-ground-truth evaluation.
+IMU and battery values are always logged truthfully, creating realistic
+GPS-vs-IMU inconsistency for LSTM autoencoder anomaly detection.
+
+Columns:
+  - true_lat_deg / true_lon_deg: Ground-truth GPS (unspoofed)
+  - lat_deg / lon_deg: Reported GPS (spoofed if attack active)
+  - label: "normal" (before attack) or "attack" (during spoofing)
+  - attack_elapsed_s: Seconds since spoofing began (0 if normal)
 """
 
 import argparse
 import asyncio
 import csv
+import logging
 import math
 import time
 from datetime import datetime
 from pathlib import Path
 
 from mavsdk import System
-from mavsdk.action import ActionError
 
+import config
+import utils
 
-# ── helpers ──────────────────────────────────────────────────────────────
+# Setup logging
+logger = utils.setup_logging(__name__)
 
-def meters_to_lat_offset(meters: float) -> float:
-    """Approximate meter offset → latitude degree offset."""
-    return meters / 111_111.0
-
-
-def meters_to_lon_offset(meters: float, lat_deg: float) -> float:
-    """Approximate meter offset → longitude degree offset at given lat."""
-    return meters / (111_111.0 * math.cos(math.radians(lat_deg)))
-
-async def wait_for_connection(drone: System) -> None:
-    print("[*] Waiting for drone connection...")
-    while True:
-        try:
-            async for state in drone.core.connection_state():
-                if state.is_connected:
-                    print("[+] Connected to drone.")
-                    return
-        except RuntimeError as e:
-            if "Core plugin has not been initialized" not in str(e):
-                raise
-        await asyncio.sleep(0.2)
-
-
-async def wait_for_health(drone: System) -> None:
-    print("[*] Waiting for global/home position estimate...")
-    async for health in drone.telemetry.health():
-        if health.is_global_position_ok and health.is_home_position_ok:
-            print("[+] Health checks passed.")
-            return
-        await asyncio.sleep(1)
-
-
-async def maybe_arm_and_takeoff(drone: System, do_takeoff: bool) -> bool:
-    if not do_takeoff:
-        print("[*] --do-takeoff not set: skipping arm/takeoff.")
-        return False
-    await wait_for_health(drone)
-    try:
-        print("[*] Arming...")
-        await drone.action.arm()
-        print("[+] Armed.")
-    except ActionError as e:
-        print(f"[!] Arm failed: {e}. Logging continues without takeoff.")
-        return False
-    try:
-        print("[*] Taking off...")
-        await drone.action.takeoff()
-        await asyncio.sleep(3)
-        return True
-    except ActionError as e:
-        print(f"[!] Takeoff failed: {e}. Logging continues.")
-        return False
-
-
-# ── main ─────────────────────────────────────────────────────────────────
 
 async def main() -> None:
+    """Main GPS-spoofing flight logger coroutine."""
     parser = argparse.ArgumentParser(
-        description="Log flight telemetry with optional GPS spoofing."
+        description="Log flight telemetry with optional GPS spoofing.",
+        epilog="""
+Examples:
+  python3 gps_spoof_fly_and_log.py --scenario hover --duration 60
+  python3 gps_spoof_fly_and_log.py --scenario hover --duration 90 \\
+      --attack-start 30 --drift-rate-m-per-s 1.5 --do-takeoff
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    # flight params
-    parser.add_argument("--scenario", default="spoof_drift")
-    parser.add_argument("--run-id", default="01")
-    parser.add_argument("--duration", type=float, default=60.0,
-                        help="Total logging duration (seconds)")
-    parser.add_argument("--rate", type=float, default=10.0,
-                        help="Logging rate (Hz)")
-    parser.add_argument("--do-takeoff", action="store_true")
 
-    # attack params
-    parser.add_argument("--attack-start", type=float, default=10.0,
-                        help="Seconds after logging starts to begin spoofing")
-    parser.add_argument("--drift-rate-m-per-s", type=float, default=1.5,
-                        help="GPS drift speed in meters/second (north-east)")
-    parser.add_argument("--drift-direction-deg", type=float, default=45.0,
-                        help="Direction of drift in degrees (0=north, 90=east)")
+    # Flight parameters
+    parser.add_argument(
+        "--scenario", default="spoof_drift", help="Scenario label for output"
+    )
+    parser.add_argument(
+        "--run-id", default="01", help="Run identifier (e.g., 01, 02)"
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=config.DEFAULT_LOGGING_DURATION_S,
+        help="Total logging duration (seconds)",
+    )
+    parser.add_argument(
+        "--rate",
+        type=float,
+        default=config.DEFAULT_LOGGING_RATE_HZ,
+        help="Logging rate (Hz)",
+    )
+    parser.add_argument(
+        "--do-takeoff", action="store_true", help="Arm and takeoff before logging"
+    )
+    parser.add_argument(
+        "--system-address",
+        default=config.DEFAULT_SYSTEM_ADDRESS,
+        help="MAVSDK system address",
+    )
+
+    # Attack parameters
+    parser.add_argument(
+        "--attack-start",
+        type=float,
+        default=10.0,
+        help="Delay before spoofing begins (seconds)",
+    )
+    parser.add_argument(
+        "--drift-rate-m-per-s",
+        type=float,
+        default=config.GPS_DRIFT_RATE_MPS,
+        help="GPS drift speed (meters/second)",
+    )
+    parser.add_argument(
+        "--drift-direction-deg",
+        type=float,
+        default=config.GPS_DRIFT_DIRECTION_DEG,
+        help="Drift direction in degrees (0=North, 90=East)",
+    )
 
     args = parser.parse_args()
 
-    # output
-    raw_dir = Path("data") / "attack_flights" / "raw"
+    # Validate arguments
+    if args.duration <= 0 or args.rate <= 0:
+        logger.error("Duration and rate must be positive")
+        parser.print_help()
+        return
+
+    if args.attack_start < 0:
+        logger.error("attack-start must be non-negative")
+        return
+
+    if args.attack_start >= args.duration:
+        logger.warning("attack-start >= duration; spoofing never begins")
+
+    # Setup output directory
+    raw_dir = Path(config.DEFAULT_ATTACK_LOG_DIR)
     raw_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate output filename
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_name = f"{args.scenario}_run{args.run_id}_{ts}.csv"
+    out_name = f"flight_{ts}.csv"
     out_path = raw_dir / out_name
 
-    # connect
-    drone = System()
-    await drone.connect(system_address="udpin://0.0.0.0:14030")
-    await wait_for_connection(drone)
-    took_off = await maybe_arm_and_takeoff(drone, args.do_takeoff)
+    logger.info(f"Scenario: {args.scenario}, Run: {args.run_id}")
+    logger.info(f"Duration: {args.duration}s, Rate: {args.rate} Hz")
+    logger.info(
+        f"Attack starts at {args.attack_start}s, "
+        f"drift={args.drift_rate_m_per_s:.1f} m/s @ {args.drift_direction_deg:.0f}°"
+    )
+    logger.info(f"Output: {out_path}")
 
-    # shared latest telemetry
-    latest: dict = {
-        "lat_deg": None, "lon_deg": None,
-        "abs_alt_m": None, "rel_alt_m": None,
-        "accel_x_mps2": None, "accel_y_mps2": None, "accel_z_mps2": None,
-        "gyro_x_rps": None, "gyro_y_rps": None, "gyro_z_rps": None,
-        "battery_remaining_pct": None, "battery_voltage_v": None,
+    # Connect to PX4 SITL
+    drone = System()
+    try:
+        await drone.connect(system_address=args.system_address)
+        logger.info(f"Connecting to {args.system_address}...")
+    except Exception as e:
+        logger.error(f"Failed to initiate connection: {e}", exc_info=True)
+        return
+
+    # Wait for connection with timeout
+    try:
+        await utils.wait_for_connection(drone, verbose=True)
+    except TimeoutError as e:
+        logger.error(str(e))
+        return
+    except Exception as e:
+        logger.error(f"Unexpected error during connection: {e}", exc_info=True)
+        return
+
+    # Try to arm/takeoff if requested
+    took_off = await utils.maybe_arm_and_takeoff(drone, args.do_takeoff, verbose=True)
+
+    # Initialize telemetry snapshot dict
+    latest = {
+        "lat_deg": None,
+        "lon_deg": None,
+        "abs_alt_m": None,
+        "rel_alt_m": None,
+        "accel_x_mps2": None,
+        "accel_y_mps2": None,
+        "accel_z_mps2": None,
+        "gyro_x_rps": None,
+        "gyro_y_rps": None,
+        "gyro_z_rps": None,
+        "battery_remaining_pct": None,
+        "battery_voltage_v": None,
     }
 
-    async def read_position():
-        async for p in drone.telemetry.position():
-            latest["lat_deg"] = p.latitude_deg
-            latest["lon_deg"] = p.longitude_deg
-            latest["abs_alt_m"] = p.absolute_altitude_m
-            latest["rel_alt_m"] = p.relative_altitude_m
-
-    async def read_imu():
-        async for imu in drone.telemetry.imu():
-            latest["accel_x_mps2"] = imu.acceleration_frd.forward_m_s2
-            latest["accel_y_mps2"] = imu.acceleration_frd.right_m_s2
-            latest["accel_z_mps2"] = imu.acceleration_frd.down_m_s2
-            latest["gyro_x_rps"] = imu.angular_velocity_frd.forward_rad_s
-            latest["gyro_y_rps"] = imu.angular_velocity_frd.right_rad_s
-            latest["gyro_z_rps"] = imu.angular_velocity_frd.down_rad_s
-
-    async def read_battery():
-        async for b in drone.telemetry.battery():
-            latest["battery_remaining_pct"] = b.remaining_percent
-            latest["battery_voltage_v"] = getattr(b, "voltage_v", None)
-
+    # Create background telemetry streaming tasks
     tasks = [
-        asyncio.create_task(read_position()),
-        asyncio.create_task(read_imu()),
-        asyncio.create_task(read_battery()),
+        asyncio.create_task(utils.read_position(drone, latest)),
+        asyncio.create_task(utils.read_imu(drone, latest)),
+        asyncio.create_task(utils.read_battery(drone, latest)),
     ]
 
-    # precompute drift components
+    # Precompute drift components (North/East decomposition)
     dir_rad = math.radians(args.drift_direction_deg)
     drift_north_mps = args.drift_rate_m_per_s * math.cos(dir_rad)
     drift_east_mps = args.drift_rate_m_per_s * math.sin(dir_rad)
 
     fieldnames = [
-        "timestamp_unix_s", "timestamp_iso", "scenario", "run_id",
-        "label",                       # "normal" or "attack"
-        "attack_elapsed_s",            # seconds since spoofing began (0 if normal)
-        "true_lat_deg", "true_lon_deg",  # ground-truth GPS
-        "lat_deg", "lon_deg",          # what the "sensor" reports (spoofed if attack)
-        "abs_alt_m", "rel_alt_m",
-        "accel_x_mps2", "accel_y_mps2", "accel_z_mps2",
-        "gyro_x_rps", "gyro_y_rps", "gyro_z_rps",
-        "battery_remaining_pct", "battery_voltage_v",
+        "timestamp_unix_s",
+        "timestamp_iso",
+        "scenario",
+        "run_id",
+        "label",  # "normal" or "attack"
+        "attack_elapsed_s",  # Time since spoofing began (0 if normal)
+        "true_lat_deg",
+        "true_lon_deg",  # Ground-truth GPS
+        "lat_deg",
+        "lon_deg",  # Reported GPS (may be spoofed)
+        "abs_alt_m",
+        "rel_alt_m",
+        "accel_x_mps2",
+        "accel_y_mps2",
+        "accel_z_mps2",
+        "gyro_x_rps",
+        "gyro_y_rps",
+        "gyro_z_rps",
+        "battery_remaining_pct",
+        "battery_voltage_v",
     ]
 
-    print(f"[*] Logging {args.duration:.0f}s @ {args.rate:.0f} Hz -> {out_path}")
-    print(f"[*] Attack starts at t={args.attack_start:.1f}s, "
-          f"drift={args.drift_rate_m_per_s:.1f} m/s @ {args.drift_direction_deg:.0f}°")
-
+    # Main logging loop
+    print(
+        f"Logging {args.duration:.0f}s @ {args.rate:.0f} Hz -> {out_path}"
+    )
     start = time.time()
     period = 1.0 / args.rate
+    row_count = 0
 
     try:
         with out_path.open("w", newline="", encoding="utf-8") as f:
@@ -192,13 +220,17 @@ async def main() -> None:
                 true_lat = latest["lat_deg"]
                 true_lon = latest["lon_deg"]
 
-                # Compute spoofed GPS if past attack start
+                # Compute spoofed GPS coordinates if attack is active
                 if elapsed >= args.attack_start and true_lat is not None:
                     attack_t = elapsed - args.attack_start
                     offset_north_m = drift_north_mps * attack_t
                     offset_east_m = drift_east_mps * attack_t
-                    spoofed_lat = true_lat + meters_to_lat_offset(offset_north_m)
-                    spoofed_lon = true_lon + meters_to_lon_offset(offset_east_m, true_lat)
+                    spoofed_lat = true_lat + utils.meters_to_lat_offset(
+                        offset_north_m
+                    )
+                    spoofed_lon = true_lon + utils.meters_to_lon_offset(
+                        offset_east_m, true_lat
+                    )
                     label = "attack"
                 else:
                     spoofed_lat = true_lat
@@ -229,20 +261,41 @@ async def main() -> None:
                     "battery_voltage_v": latest["battery_voltage_v"],
                 }
                 writer.writerow(row)
+                row_count += 1
                 await asyncio.sleep(period)
+
+    except IOError as e:
+        logger.error(f"Failed to write CSV: {e}", exc_info=True)
+        return
     finally:
+        # Gracefully shutdown telemetry tasks
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Land if we took off
         if took_off:
-            print("[*] Landing...")
+            print("Landing...")
             try:
                 await drone.action.land()
-                await asyncio.sleep(5)
-            except ActionError as e:
-                print(f"[!] Land failed: {e}")
+                await asyncio.sleep(config.SLEEP_DURING_LANDING_S)
+                logger.info("Landing complete.")
+            except Exception as e:
+                logger.warning(f"Land failed: {e}")
 
-    print(f"[+] Done. Saved to {out_path}")
+    # Validate output
+    print(f"Logged {row_count} rows to {out_path}")
+    utils.validate_csv_output(str(out_path), verbose=True)
+    logger.info(f"GPS spoof flight logging complete: {row_count} samples")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
 
 
 if __name__ == "__main__":

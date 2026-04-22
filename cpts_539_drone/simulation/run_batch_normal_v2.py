@@ -1,14 +1,43 @@
+"""
+run_batch_normal_v2.py
+======================
+Advanced batch runner with scenario configuration matrix.
+
+Supports multiple scenarios with scenario-specific overrides for:
+- Duration, rate, number of runs, takeoff policy
+
+More flexible than run_batch_normal.py for complex test matrices.
+
+Usage:
+    python3 run_batch_normal_v2.py
+"""
+
 from __future__ import annotations
 
+import logging
 import subprocess
+import sys
+import traceback
 from pathlib import Path
-from typing import Union
+
+import config
+
+# Setup logging
+logger = logging.getLogger(__name__)
+logger.setLevel(config.LOG_LEVEL)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 PYTHON = "python3"  # or "python" depending on your VM
 
 # ---------------------------------------------------------------------------
 # Scenario configs
-# Each scenario maps to a dict of overrides.  Anything not listed falls back
+# Each scenario maps to a dict of overrides. Anything not listed falls back
 # to the defaults defined in DEFAULTS below.
 # ---------------------------------------------------------------------------
 DEFAULTS = {
@@ -20,24 +49,24 @@ DEFAULTS = {
 
 SCENARIOS = {
     # --- core manoeuvres ---
-    "hover":          {"duration": 60.0},
-    "square":         {"duration": 120.0},
-    "altitude_step":  {"duration": 60.0},
+    "hover": {"duration": 60.0},
+    "square": {"duration": 120.0},
+    "altitude_step": {"duration": 60.0},
 
     # --- trajectory / tracking ---
-    "circle":         {"duration": 120.0},
-    "figure_eight":   {"duration": 120.0},
-    "waypoint":       {"duration": 120.0},
+    "circle": {"duration": 120.0},
+    "figure_eight": {"duration": 120.0},
+    "waypoint": {"duration": 120.0},
 
     # --- heading / rotation ---
-    "yaw_spin":       {"duration": 60.0},
+    "yaw_spin": {"duration": 60.0},
 
     # --- environmental robustness ---
-    "wind_gust":      {"duration": 90.0},
+    "wind_gust": {"duration": 90.0},
 
     # --- safety ---
-    "failsafe":       {"duration": 45.0, "runs": 3, "do_takeoff": False},
-    "landing":        {"duration": 45.0},
+    "failsafe": {"duration": 45.0, "runs": 3, "do_takeoff": False},
+    "landing": {"duration": 45.0},
 }
 
 # ---------------------------------------------------------------------------
@@ -54,7 +83,7 @@ SCENARIOS = {
 DO_TAKEOFF_GLOBAL = False
 
 
-def get(scenario_name: str, key: str) -> Union[float, int, bool]:
+def get(scenario_name: str, key: str) -> float | int | bool:
     """Return a scenario-specific value or fall back to the default."""
     return SCENARIOS[scenario_name].get(key, DEFAULTS[key])
 
@@ -67,9 +96,74 @@ def should_takeoff(scenario: str) -> bool:
     return DO_TAKEOFF_GLOBAL
 
 
-def main() -> None:
+def run_subprocess(
+    cmd: list, timeout_s: float = None, tag: str = ""
+) -> bool:
+    """
+    Run a subprocess with timeout and error handling.
+
+    Args:
+        cmd: Command as list of strings.
+        timeout_s: Timeout in seconds. Defaults to config.TIMEOUT_SUBPROCESS_S.
+        tag: Label for logging.
+
+    Returns:
+        True if return code is 0, False otherwise.
+    """
+    if timeout_s is None:
+        timeout_s = config.TIMEOUT_SUBPROCESS_S
+
+    try:
+        logger.info(f"[{tag}] Running: {' '.join(cmd)}")
+        result = subprocess.run(
+            cmd,
+            timeout=timeout_s,
+            check=False,
+        )
+        if result.returncode == 0:
+            logger.info(f"[{tag}] Success (rc=0)")
+            return True
+        else:
+            logger.warning(
+                f"[{tag}] Exited with code {result.returncode}. "
+                f"Check subprocess output above."
+            )
+            return False
+    except FileNotFoundError as e:
+        logger.error(
+            f"[{tag}] Script not found: {e}. "
+            f"Ensure working directory is project root."
+        )
+        return False
+    except subprocess.TimeoutExpired:
+        logger.error(
+            f"[{tag}] Subprocess timed out after {timeout_s}s. "
+            f"Process may still be running."
+        )
+        return False
+    except Exception as e:
+        logger.error(f"[{tag}] Unexpected error: {e}")
+        logger.error(traceback.format_exc())
+        return False
+
+
+def main() -> bool:
+    """Main batch runner with scenario matrix."""
+    logger.info("="*70)
+    logger.info("Starting batch normal flight scenarios (v2)")
+    logger.info("="*70)
+
     base_cmd = [PYTHON, "simulation/fly_and_log.py"]
     failed_runs: list[str] = []
+
+    # Calculate total runs for progress tracking
+    total_runs = sum(int(get(s, "runs")) for s in SCENARIOS)
+    completed = 0
+
+    logger.info(f"Total scenarios: {len(SCENARIOS)}")
+    logger.info(f"Expected total runs: {total_runs}")
+    logger.info(f"Global takeoff policy: {'ENABLED' if DO_TAKEOFF_GLOBAL else 'DISABLED'}")
+    logger.info("="*70)
 
     for scenario in SCENARIOS:
         runs = int(get(scenario, "runs"))
@@ -77,58 +171,70 @@ def main() -> None:
         rate = float(get(scenario, "rate_hz"))
         takeoff = should_takeoff(scenario)
 
+        logger.info(f"\nScenario: {scenario}")
+        logger.info(
+            f"  Config: duration={duration}s, rate={rate}Hz, "
+            f"runs={runs}, takeoff={'YES' if takeoff else 'NO'}"
+        )
+
         for run_idx in range(1, runs + 1):
             run_id = f"{run_idx:02d}"
             tag = f"{scenario} run {run_id}"
             cmd = base_cmd + [
-                "--scenario", scenario,
-                "--run-id",   run_id,
-                "--duration", str(duration),
-                "--rate",     str(rate),
+                "--scenario",
+                scenario,
+                "--run-id",
+                run_id,
+                "--duration",
+                str(duration),
+                "--rate",
+                str(rate),
             ]
 
             if takeoff:
                 cmd.append("--do-takeoff")
 
-            print(f"\n{'='*60}")
-            print(f"  Scenario : {scenario}")
-            print(f"  Run      : {run_id}/{runs:02d}")
-            print(f"  Duration : {duration}s  |  Rate: {rate} Hz")
-            print(f"  Takeoff  : {'YES' if takeoff else 'NO (dry run)'}")
-            print(f"  Command  : {' '.join(cmd)}")
-            print(f"{'='*60}")
+            logger.info(f"\n{'='*70}")
+            logger.info(f"  Run {run_id}/{runs:02d} of scenario '{scenario}'")
+            logger.info(f"  Duration: {duration}s | Rate: {rate}Hz | Takeoff: {'YES' if takeoff else 'NO'}")
+            logger.info(f"{'='*70}")
 
-            try:
-                result = subprocess.run(cmd)
+            # Run scenario
+            success = run_subprocess(cmd, tag=tag)
+            if success:
+                completed += 1
+            else:
+                failed_runs.append(tag)
 
-                if result.returncode != 0:
-                    print(f"[WARN] {tag} exited with code {result.returncode}")
-                    failed_runs.append(f"{tag} (exit {result.returncode})")
+            # Progress update
+            progress_pct = 100 * completed / total_runs
+            logger.info(
+                f"Progress: {completed}/{total_runs} ({progress_pct:.0f}%) completed"
+            )
 
-            except FileNotFoundError:
-                print(f"[ERROR] Could not find '{cmd[0]}' or "
-                      f"'{cmd[1]}' — check your paths")
-                failed_runs.append(f"{tag} (file not found)")
-
-            except Exception as exc:
-                print(f"[ERROR] {tag} unexpected error: {exc}")
-                failed_runs.append(f"{tag} ({type(exc).__name__})")
-
-    # ---- summary ----
-    total = sum(int(get(s, "runs")) for s in SCENARIOS)
-
-    print(f"\n{'='*60}")
-    print(f"  All done — {total} total runs across {len(SCENARIOS)} scenarios")
-
+    # Summary
+    logger.info("="*70)
+    logger.info("Batch execution summary:")
+    logger.info(f"  Total runs: {total_runs}")
+    logger.info(f"  Successful: {completed}")
+    logger.info(f"  Failed: {len(failed_runs)}")
     if failed_runs:
-        print(f"  {len(failed_runs)} run(s) failed:")
+        logger.error("  Failed runs:")
         for tag in failed_runs:
-            print(f"    • {tag}")
-    else:
-        print("  All runs completed successfully.")
+            logger.error(f"    - {tag}")
+    logger.info("="*70)
 
-    print(f"{'='*60}\n")
+    return len(failed_runs) == 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        success = main()
+        sys.exit(0 if success else 1)
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        logger.error(traceback.format_exc())
+        sys.exit(1)
