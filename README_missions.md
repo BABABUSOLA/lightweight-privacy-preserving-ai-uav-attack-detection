@@ -186,8 +186,8 @@ data.zip is the compressed folder of the attacks ran used to produce the autoenc
 csv_gps_spoof.ipynb was the jupyter file used to make the gps spoof simuation
 
 
-# To restart cleanly for PX4
-# Terminal 1: kill everything and restart
+## To restart cleanly for PX4
+Terminal 1: kill everything and restart
 pkill -f px4
 pkill -f gazebo
 make px4_sitl gazebo
