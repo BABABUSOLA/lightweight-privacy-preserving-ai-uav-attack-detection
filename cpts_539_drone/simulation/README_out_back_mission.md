@@ -151,3 +151,31 @@ For stable pipelines:
 
 - Start with fewer runs (`runs=1`), then increase to `runs=2` or `runs=3`
 - If needed, restart SITL between long experiment sets to reset battery state
+
+## Anonmaly Detector Demo using the GRU autoencoder
+
+- Start PX4 SITL + mission(e.g mission_circle_fly_and_log.py)
+- Start your anomaly detector script
+- Inject fake_gps start — drone starts drifting
+- Script detects MSE > threshold
+- Script automatically sends RTL command via MAVSDK
+- PX4 receives it and the drone flies home
+
+## Demo Steps
+
+# Step 1: PX4 console:
+commander takeoff            # 1. takeoff first
+# wait for altitude...
+
+# Step 1 Alternative Start mission(e.g mission_circle_fly_and_log.py) and wait for altitude
+
+# Step 2 Another terminal:
+python anomaly_detector_px4.py   # 2. start detector
+
+# Step 3 PX4 console:
+fake_gps start               # 3. inject attack
+# → Script detects anomaly, sends RTL
+# → Drone flies home automatically
+
+# Step 4 Stop attack
+fake_gps stop                # 4. stop attack after RTL(Return to Lunch) triggers
