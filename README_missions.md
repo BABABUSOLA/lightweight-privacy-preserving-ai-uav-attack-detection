@@ -163,21 +163,21 @@ For stable pipelines:
 
 ## Demo Steps
 
-# Step 1: PX4 console:
+Step 1: PX4 console:
 commander takeoff            # 1. takeoff first
-# wait for altitude...
+wait for altitude...
 
-# Step 1 Alternative Start mission(e.g mission_circle_fly_and_log.py) and wait for altitude
+Step 1 Alternative Start mission(e.g mission_circle_fly_and_log.py) and wait for altitude
 
-# Step 2 Another terminal:
+Step 2 Another terminal:
 python anomaly_detector_px4.py   # 2. start detector
 
-# Step 3 PX4 console:
+Step 3 PX4 console:
 fake_gps start               # 3. inject attack
-# → Script detects anomaly, sends RTL
-# → Drone flies home automatically
+→ Script detects anomaly, sends RTL
+→ Drone flies home automatically
 
-# Step 4 Stop attack
+Step 4 Stop attack
 fake_gps stop                # 4. stop attack after RTL(Return to Lunch) triggers
 
 
