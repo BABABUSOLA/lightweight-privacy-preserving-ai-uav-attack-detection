@@ -227,9 +227,9 @@ async def wait_for_landed_hold_state(
     Wait until the vehicle is safely landed and stabilized.
 
     Success condition:
+        - flight mode is HOLD
         - armed is False
         - in_air is False
-        - mode may vary by PX4 state machine after land (HOLD/POSCTL/etc)
     """
     start = time.time()
     while (time.time() - start) < timeout_s:
@@ -248,14 +248,9 @@ async def wait_for_landed_hold_state(
             continue
 
         mode_name = getattr(mode, "name", str(mode))
-        # Accept any post-landing mode as long as the vehicle is disarmed
-        # and on ground. Some PX4 SITL runs do not settle in HOLD.
-        if (armed is False) and (in_air is False):
+        if mode_name == "HOLD" and (armed is False) and (in_air is False):
             if verbose:
-                print(
-                    "Landing gate passed: disarmed + on-ground "
-                    f"(mode={mode_name})."
-                )
+                print("Landing gate passed: HOLD + disarmed + on-ground.")
             logger.info("Landing gate passed.")
             return True
 
@@ -267,7 +262,7 @@ async def wait_for_landed_hold_state(
         await asyncio.sleep(poll_s)
 
     logger.error(
-        "Landing gate timeout: vehicle did not reach disarmed/on-ground state "
+        "Landing gate timeout: vehicle did not reach HOLD/disarmed/on-ground state "
         f"within {timeout_s:.1f}s."
     )
     return False

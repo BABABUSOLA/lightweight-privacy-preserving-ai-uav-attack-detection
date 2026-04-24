@@ -4,8 +4,8 @@ Master Pipeline Runner
 Runs the full data-collection pipeline sequentially.
 
 Includes two spoofing options:
-  (A) Real-time GPS spoof logging on out-and-back mission
-  (B) Data-level spoofing (CSV-only): simulation/gps_spoof_fly_and_log.py
+  (A) Data-level spoofing (CSV-only): simulation/gps_spoof_fly_and_log.py
+  (B) System-level spoofing (PX4-facing): simulation/gps_input_spoofer.py + a moving flight logger
 
 Usage:
     python3 run_pipeline.py
@@ -77,47 +77,47 @@ class SpoofedMissionStep:
 # Pipeline — edit this list to add / remove / reorder steps
 # ---------------------------------------------------------------------------
 PIPELINE: list[object] = [
-    # Step 1: Normal out-and-back mission
+    # Step 1: Normal flights (hover + square) via run_batch_normal.py
+    # run_batch_normal.py handles its own internal loop, so runs=1.
     Step(
-        name="Normal out-and-back high/fast mission",
-        script="simulation/mission_out_back_fly_and_log.py",
-        args=[
-            "--scenario",
-            "out_back_high_fast",
-            "--cruise-seconds",
-            "10",
-            "--cruise-speed-mps",
-            "16",
-            "--mission-alt-m",
-            "25",
-            "--do-takeoff",
-        ],
-        runs=1,
-        inject_run_id=True,
+        name="Normal flight batch (hover + square)",
+        script="simulation/run_batch_normal.py",
+        inject_run_id=False,
     ),
-    # Step 2: Real-time GPS spoofing on out-and-back mission
-    Step(
-        name="Out-and-back real-time spoof high/fast (fast drift E)",
-        script="simulation/mission_out_back_gps_spoof_fly_and_log.py",
-        args=[
+    # Step 2: Threat-model-aligned spoofing (system-level): GPS_INPUT injection
+    # Run the spoofer alongside the square mission logger so the vehicle moves.
+    SpoofedMissionStep(
+        name="GPS_INPUT spoof + square mission (slow drift NE)",
+        spoofer_script="simulation/gps_input_spoofer.py",
+        spoofer_args=[
+            "--master",
+            "udp:127.0.0.1:14540",
+            "--rate-hz",
+            "10",
+            "--attack-start",
+            "10",
+            "--drift-rate-m-per-s",
+            "1.5",
+            "--drift-direction-deg",
+            "45",
+        ],
+        flight_script="simulation/mission_square_fly_and_log.py",
+        flight_args=[
             "--scenario",
-            "out_back_high_fast_spoof",
-            "--cruise-seconds",
+            "attack_square_gpsinput_drift",
+            "--duration",
+            "90",
+            "--rate",
+            "10",
+            "--mission-size-m",
+            "25",
+            "--mission-alt-m",
             "10",
             "--cruise-speed-mps",
-            "16",
-            "--mission-alt-m",
-            "25",
-            "--attack-start",
-            "3",
-            "--drift-rate-m-per-s",
-            "5.0",
-            "--drift-direction-deg",
-            "90",
+            "4",
             "--do-takeoff",
         ],
-        runs=1,
-        inject_run_id=True,
+        runs=3,
     ),
     # Step 3: Baseline spoofing (data-level): CSV-only drift (kept for reproducibility)
     Step(
@@ -138,7 +138,7 @@ PIPELINE: list[object] = [
             "45",
             "--do-takeoff",
         ],
-        runs=1,
+        runs=3,
         inject_run_id=True,
     ),
 ]

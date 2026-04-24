@@ -65,7 +65,7 @@ SLEEP_AFTER_TAKEOFF_S = 3.0
 SLEEP_AFTER_MISSION_S = 2.0
 """Wait time after mission completion before landing."""
 
-SLEEP_DURING_LANDING_S = 20.0
+SLEEP_DURING_LANDING_S = 5.0
 """Wait time while landing to stabilize."""
 
 # ============================================================================
