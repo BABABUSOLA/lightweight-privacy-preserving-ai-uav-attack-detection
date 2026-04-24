@@ -34,6 +34,10 @@ python3 cpts_539_drone/simulation/mission_out_back_fly_and_log.py \
   --mission-alt-m 12 \
   --output-dir data/normal_flights/raw
 ```
+```bash
+python3 simulation/mission_out_back_fly_and_log.py --log-only --cruise-seconds 30       --log-buffer-s 60
+  --output-dir data/normal_flights/raw
+```
 
 ### How timing works
 
