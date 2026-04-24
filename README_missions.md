@@ -179,3 +179,8 @@ fake_gps start               # 3. inject attack
 
 # Step 4 Stop attack
 fake_gps stop                # 4. stop attack after RTL(Return to Lunch) triggers
+
+
+## Notes
+data.zip is the compressed folder of the attacks ran used to produce the autoencoder
+csv_gps_spoof.ipynb was the jupyter file used to 
