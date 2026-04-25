@@ -39,9 +39,20 @@ logger.setLevel(logging.INFO)
 # ─────────────────────────────────────────────────
 # 1. GRU Model Definition (must match training)
 # ─────────────────────────────────────────────────
+# IMPORTANT: This architecture must exactly match the notebook (Cell 43).
+# The decoder GRU outputs directly to n_features — there is NO separate
+# output Linear layer. Mismatching this will cause state_dict load failures.
+
 class GRUAutoencoder(nn.Module):
-    def __init__(self, n_features=10, hidden_size=32, latent_size=16, num_layers=1):
+    def __init__(self, n_features: int = 10, hidden_size: int = 32,
+                 latent_size: int = 16, num_layers: int = 1):
         super().__init__()
+        self.n_features = n_features
+        self.hidden_size = hidden_size
+        self.latent_size = latent_size
+        self.num_layers = num_layers
+
+        # Encoder
         self.encoder_gru = nn.GRU(
             input_size=n_features,
             hidden_size=hidden_size,
@@ -49,24 +60,32 @@ class GRUAutoencoder(nn.Module):
             batch_first=True,
         )
         self.encoder_fc = nn.Linear(hidden_size, latent_size)
+
+        # Decoder
         self.decoder_fc = nn.Linear(latent_size, hidden_size)
         self.decoder_gru = nn.GRU(
             input_size=hidden_size,
-            hidden_size=hidden_size,
+            hidden_size=n_features,      # <-- outputs n_features directly
             num_layers=num_layers,
             batch_first=True,
         )
-        self.output_layer = nn.Linear(hidden_size, n_features)
+        # NOTE: No output_layer — decoder GRU hidden_size == n_features
 
     def forward(self, x):
         batch_size, seq_len, _ = x.size()
-        _, h_n = self.encoder_gru(x)
-        h_last = h_n[-1]
-        z = self.encoder_fc(h_last)
-        dec_in = self.decoder_fc(z).unsqueeze(1).repeat(1, seq_len, 1)
-        dec_out, _ = self.decoder_gru(dec_in)
-        recon = self.output_layer(dec_out)
-        return recon
+
+        # Encoder: keep last hidden state (GRU has no cell state)
+        enc_out, h_n = self.encoder_gru(x)
+        h_last = h_n[-1]                           # (batch, hidden_size)
+
+        z = self.encoder_fc(h_last)                 # (batch, latent_size)
+
+        # Repeat latent for each time step
+        dec_in = self.decoder_fc(z)                 # (batch, hidden_size)
+        dec_in = dec_in.unsqueeze(1).repeat(1, seq_len, 1)  # (batch, seq_len, hidden_size)
+
+        dec_out, _ = self.decoder_gru(dec_in)       # (batch, seq_len, n_features)
+        return dec_out
 
 
 # ─────────────────────────────────────────────────
@@ -74,22 +93,41 @@ class GRUAutoencoder(nn.Module):
 # ─────────────────────────────────────────────────
 MODEL_PATH = "models/gru_autoencoder.pth"
 SCALER_PATH = "models/scaler.pkl"
-THRESHOLD = 0.9468           # your GRU 95th percentile threshold
-SEQ_LEN = 50                 # must match training
+
+# GRU 95th percentile threshold from notebook (Cell 48):
+#   GRU anomaly threshold (95th pct): 3.403265
+THRESHOLD = 3.403265
+
+SEQ_LEN = 50                   # must match training window size
+N_FEATURES = 10                # lat, lon, rel_alt, accel_xyz, gyro_xyz, battery_pct
 SITL_ADDRESS = "udp://:14540"  # default PX4 SITL address
-ALERT_COOLDOWN = 5.0         # seconds between repeated alerts
+ALERT_COOLDOWN = 5.0           # seconds between repeated alerts
 TIMEOUT_CONNECTION_S = 20.0
 TIMEOUT_HEALTH_S = 30.0
+
+# Feature columns (must match training order from notebook Cell 10):
+#   lat_deg, lon_deg, rel_alt_m,
+#   accel_x_mps2, accel_y_mps2, accel_z_mps2,
+#   gyro_x_rps, gyro_y_rps, gyro_z_rps,
+#   battery_remaining_pct
 
 
 # ─────────────────────────────────────────────────
 # 3. Load model and scaler
 # ─────────────────────────────────────────────────
 def load_model():
-    model = GRUAutoencoder(n_features=10, hidden_size=32, latent_size=16)
+    model = GRUAutoencoder(
+        n_features=N_FEATURES,
+        hidden_size=32,
+        latent_size=16,
+        num_layers=1,
+    )
     model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
     model.eval()
-    logger.info(f"[INIT] Model loaded from {MODEL_PATH}")
+
+    param_count = sum(p.numel() for p in model.parameters())
+    logger.info(f"[INIT] GRU model loaded from {MODEL_PATH} "
+                f"({param_count:,} params, ~{param_count * 4 / 1024:.1f} KB)")
     return model
 
 
@@ -106,17 +144,22 @@ def check_anomaly(buffer, model, scaler, threshold):
     """
     Takes the last SEQ_LEN readings, scales them,
     runs inference, returns (is_anomaly, mse_error).
+
+    MSE is computed as mean over (seq_len, n_features) matching
+    the per-sequence error used during training (Cell 48/50):
+        batch_errors = ((recon - batch) ** 2).mean(dim=(1, 2))
     """
     if len(buffer) < SEQ_LEN:
         return False, 0.0
 
-    raw = np.array(list(buffer)[-SEQ_LEN:])       # (50, 10)
-    scaled = scaler.transform(raw)                  # same normalization as training
+    raw = np.array(list(buffer)[-SEQ_LEN:])             # (50, 10)
+    scaled = scaler.transform(raw)                        # same normalization as training
     tensor = torch.from_numpy(scaled).float().unsqueeze(0)  # (1, 50, 10)
 
     with torch.no_grad():
         recon = model(tensor)
-        mse = ((recon - tensor) ** 2).mean().item()
+        # Per-sequence MSE: mean over both time and feature dimensions
+        mse = ((recon - tensor) ** 2).mean(dim=(1, 2)).item()
 
     return mse > threshold, mse
 
@@ -182,8 +225,8 @@ async def send_mavlink_alert(drone, mse):
     print(f"  >> MAVLink alert would be sent: MSE={mse:.4f}")
 
     # Uncomment below to trigger automatic RETURN TO LAUNCH:
-    # print("  >> TRIGGERING RETURN TO LAUNCH")
-    # await drone.action.return_to_launch()
+    print("  >> TRIGGERING RETURN TO LAUNCH")
+    await drone.action.return_to_launch()
 
     # Uncomment below to trigger automatic LAND:
     # print("  >> TRIGGERING LAND")
@@ -311,6 +354,11 @@ async def detection_loop(drone, model, scaler, alert_mgr):
 
     while True:
         # Build a reading with the same 10 features as training
+        # Order must match FEATURE_COLS from notebook:
+        #   lat_deg, lon_deg, rel_alt_m,
+        #   accel_x_mps2, accel_y_mps2, accel_z_mps2,
+        #   gyro_x_rps, gyro_y_rps, gyro_z_rps,
+        #   battery_remaining_pct
         reading = [
             latest["lat"],
             latest["lon"],
@@ -335,7 +383,7 @@ async def detection_loop(drone, model, scaler, alert_mgr):
             if should_alert:
                 await send_mavlink_alert(drone, mse)
 
-        # ~10 Hz sampling rate (adjust to match your training data rate)
+        # ~10 Hz sampling rate (matches training data collection rate)
         await asyncio.sleep(0.1)
 
 
@@ -346,6 +394,8 @@ async def main():
     print("=" * 60)
     print("  PX4 SITL Anomaly Detector")
     print("  GRU Autoencoder — Real-time Detection")
+    print(f"  Threshold: {THRESHOLD:.6f} (95th percentile)")
+    print(f"  Window: {SEQ_LEN} steps x {N_FEATURES} features")
     print("=" * 60)
 
     # Load model and scaler

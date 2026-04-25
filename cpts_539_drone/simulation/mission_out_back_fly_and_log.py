@@ -143,6 +143,11 @@ async def main() -> int:
         help="If set, arm and fly mission",
     )
     parser.add_argument(
+        "--log-only",
+        action="store_true",
+        help="Only log telemetry until drone lands (start mission from QGC)",
+    )
+    parser.add_argument(
         "--mission-alt-m",
         type=float,
         default=12.0,
@@ -259,59 +264,123 @@ async def main() -> int:
     ]
 
     try:
-        if not args.do_takeoff:
+        # --- LOG-ONLY MODE ---
+        # Start the mission from QGC; this script logs until the drone lands.
+        # If the drone never flies or never lands, the log is discarded.
+        if args.log_only:
+            flew_mission = False
+            landing_ok = False
+            logger.info("Log-only mode: logging until drone lands...")
+            logger.info("Start the mission from QGC when ready.")
+
+            # Tracks whether the drone actually flew and landed
+            landed_event = asyncio.Event()
+            mission_flew = False
+
+            async def watch_for_landing():
+                """Monitor landed_state: wait for IN_AIR, then stop on ON_GROUND."""
+                nonlocal mission_flew
+                was_in_air = False
+                async for state in drone.telemetry.landed_state():
+                    state_str = str(state)
+                    if "IN_AIR" in state_str:
+                        if not was_in_air:
+                            logger.info("Drone is in the air. Logging active.")
+                        was_in_air = True
+                        mission_flew = True
+                    if was_in_air and "ON_GROUND" in state_str:
+                        logger.info("Drone has landed. Stopping logging.")
+                        landed_event.set()
+                        return
+
+            landing_task = asyncio.create_task(watch_for_landing())
+            period = 1.0 / args.rate
+
+            with out_tmp_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                while not landed_event.is_set():
+                    now = time.time()
+                    writer.writerow(
+                        {
+                            "timestamp_unix_s": now,
+                            "timestamp_iso": datetime.utcfromtimestamp(now).isoformat(),
+                            "scenario": args.scenario,
+                            "run_id": args.run_id,
+                            **latest,
+                        }
+                    )
+                    row_count += 1
+                    await asyncio.sleep(period)
+
+            landing_task.cancel()
+
+            # Only mark as successful if the drone actually flew and landed
+            if mission_flew and landed_event.is_set():
+                logging_ok = row_count > 0
+                landing_ok = True
+                logger.info(f"Mission completed. Logged {row_count} rows.")
+            else:
+                logging_ok = False
+                landing_ok = False
+                logger.warning("Mission did not complete. Log will be discarded.")
+
+        # --- NO TAKEOFF REQUESTED ---
+        elif not args.do_takeoff:
             logger.warning(
                 "Takeoff not requested (--do-takeoff not set); skipping CSV logging "
                 "because this run did not execute a flight."
             )
             return 1
 
-        try:
-            logger.info("Building out-and-back mission...")
-            plan = build_out_back_mission(
-                origin_lat=origin_lat,
-                origin_lon=origin_lon,
-                one_way_distance_m=one_way_distance_m,
-                rel_alt_m=args.mission_alt_m,
-                cruise_speed_m_s=args.cruise_speed_mps,
-            )
-            logger.info(f"Uploading mission with {len(plan.mission_items)} waypoints...")
-            await drone.mission.set_return_to_launch_after_mission(True)
-            await drone.mission.upload_mission(plan)
-
-            logger.info("Arming...")
-            await drone.action.arm()
-            logger.info("Starting mission...")
-            await drone.mission.start_mission()
-            flew_mission = True
-            logger.info("Mission started successfully")
-        except Exception as e:
-            logger.warning(f"Mission start failed: {e}. Skipping CSV logging.")
-            return 1
-
-        logger.info(
-            f"Logging for {total_log_duration_s:.1f}s at {args.rate:.1f} Hz -> {out_tmp_path}"
-        )
-        start = time.time()
-        period = 1.0 / args.rate
-
-        with out_tmp_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            while (time.time() - start) < total_log_duration_s:
-                now = time.time()
-                writer.writerow(
-                    {
-                        "timestamp_unix_s": now,
-                        "timestamp_iso": datetime.utcfromtimestamp(now).isoformat(),
-                        "scenario": args.scenario,
-                        "run_id": args.run_id,
-                        **latest,
-                    }
+        # --- FULL MISSION MODE ---
+        else:
+            try:
+                logger.info("Building out-and-back mission...")
+                plan = build_out_back_mission(
+                    origin_lat=origin_lat,
+                    origin_lon=origin_lon,
+                    one_way_distance_m=one_way_distance_m,
+                    rel_alt_m=args.mission_alt_m,
+                    cruise_speed_m_s=args.cruise_speed_mps,
                 )
-                row_count += 1
-                await asyncio.sleep(period)
-        logging_ok = row_count > 0
+                logger.info(f"Uploading mission with {len(plan.mission_items)} waypoints...")
+                await drone.mission.set_return_to_launch_after_mission(True)
+                await drone.mission.upload_mission(plan)
+
+                logger.info("Arming...")
+                await drone.action.arm()
+                logger.info("Starting mission...")
+                await drone.mission.start_mission()
+                flew_mission = True
+                logger.info("Mission started successfully")
+            except Exception as e:
+                logger.warning(f"Mission start failed: {e}. Skipping CSV logging.")
+                return 1
+
+            logger.info(
+                f"Logging for {total_log_duration_s:.1f}s at {args.rate:.1f} Hz -> {out_tmp_path}"
+            )
+            start = time.time()
+            period = 1.0 / args.rate
+
+            with out_tmp_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                while (time.time() - start) < total_log_duration_s:
+                    now = time.time()
+                    writer.writerow(
+                        {
+                            "timestamp_unix_s": now,
+                            "timestamp_iso": datetime.utcfromtimestamp(now).isoformat(),
+                            "scenario": args.scenario,
+                            "run_id": args.run_id,
+                            **latest,
+                        }
+                    )
+                    row_count += 1
+                    await asyncio.sleep(period)
+            logging_ok = row_count > 0
 
     except IOError as e:
         logger.error(f"Failed to write CSV: {e}", exc_info=True)
@@ -326,7 +395,7 @@ async def main() -> int:
                 await drone.action.land()
                 landing_ok = await utils.wait_for_landed_hold_state(
                     drone,
-                    timeout_s=max(config.SLEEP_DURING_LANDING_S, 20.0),
+                    timeout_s=max(config.SLEEP_DURING_LANDING_S, 60.0),
                     poll_s=1.0,
                     verbose=True,
                 )
@@ -354,10 +423,11 @@ async def main() -> int:
         except Exception as e:
             logger.error(f"Failed to promote temp CSV to final output: {e}", exc_info=True)
 
+    # Clean up: delete the temp file if the mission didn't complete
     try:
         if out_tmp_path.exists():
             out_tmp_path.unlink()
-            logger.info(f"Deleted temporary CSV due to failed run: {out_tmp_path}")
+            logger.info(f"Deleted temporary CSV due to incomplete mission: {out_tmp_path}")
     except Exception as e:
         logger.warning(f"Failed to delete temporary CSV {out_tmp_path}: {e}")
     return 1
