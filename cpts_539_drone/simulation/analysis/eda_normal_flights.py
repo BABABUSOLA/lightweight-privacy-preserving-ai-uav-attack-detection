@@ -1,11 +1,15 @@
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 # Point to your raw normal-flight logs
 data_dir = Path("data") / "normal_flights" / "raw"
 files = sorted(data_dir.glob("*.csv"))
+if not files:
+    raise FileNotFoundError(f"No CSV files found in {data_dir}")
+
 len(files), files[:5]
 
 #second step: load and combine
@@ -38,9 +42,6 @@ plt.ylabel("Relative altitude (m)")
 plt.title(f"Altitude vs time ({files[0].name})")
 plt.grid(True)
 plt.show()
-
-# Accel norm vs time
-import numpy as np
 
 accel = np.sqrt(
     one_run["accel_x_mps2"]**2 +

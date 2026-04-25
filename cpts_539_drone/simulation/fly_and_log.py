@@ -1,106 +1,156 @@
+"""
+fly_and_log.py
+==============
+Connects to PX4 SITL, optionally arms/takes off, and logs telemetry to CSV.
+
+Logs position, IMU, and battery data at a configurable rate.
+Uses timeout-protected connection waits to prevent indefinite hangs.
+
+Usage:
+    python3 fly_and_log.py --scenario hover --duration 60 --do-takeoff
+    python3 fly_and_log.py --scenario square --duration 120
+
+Output:
+    CSV file saved to data/normal_flights/raw/
+"""
+
 import argparse
 import asyncio
 import csv
-import os
+import logging
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 from mavsdk import System
-from mavsdk.action import ActionError
+
+import config
+import utils
+
+# Setup logging
+logger = utils.setup_logging(__name__)
 
 
-async def wait_for_connection(drone: System) -> None:
-    print("Waiting for drone connection...")
-    while True:
-        try:
-            async for state in drone.core.connection_state():
-                if state.is_connected:
-                    print("Connected to drone.")
-                    return
-        except RuntimeError as e:
-            if "Core plugin has not been initialized" not in str(e):
-                raise
-        await asyncio.sleep(0.2)
+def validate_args(args) -> None:
+    """Validate command-line arguments."""
+    if args.duration <= 0:
+        raise ValueError("--duration must be positive")
+    if args.rate <= 0:
+        raise ValueError("--rate must be positive")
+    if args.rate > 1000:
+        logger.warning("--rate > 1000 Hz may cause performance issues")
+    if len(args.scenario) == 0:
+        raise ValueError("--scenario cannot be empty")
 
 
-async def wait_for_health(drone: System) -> None:
-    """
-    Wait until PX4 reports good global + home position.
-    In SITL this should become true after a few seconds.
-    """
-    print("Waiting for global/home position estimate...")
-    async for health in drone.telemetry.health():
-        print(
-            "  Health status -> "
-            f"global_pos_ok={health.is_global_position_ok}, "
-            f"home_pos_ok={health.is_home_position_ok}"
-        )
-        if health.is_global_position_ok and health.is_home_position_ok:
-            print("Health checks passed.")
-            return
-        await asyncio.sleep(1)
-
-
-async def maybe_arm_and_takeoff(drone: System, do_takeoff: bool) -> bool:
-    """
-    Try to arm + take off.
-    Returns True if takeoff sequence was started, False otherwise.
-    Never raises; prints errors and lets logging continue.
-    """
-    if not do_takeoff:
-        print("DO_TAKEOFF is False: skipping arm/takeoff.")
-        return False
-
-    await wait_for_health(drone)
-
-    print("Attempting to arm...")
-    try:
-        await drone.action.arm()
-        print("Armed.")
-    except ActionError as e:
-        print(f"[WARN] Arm failed: {e}. Logging will continue without takeoff.")
-        return False
-
-    print("Attempting takeoff...")
-    try:
-        await drone.action.takeoff()
-        print("Takeoff command sent.")
-        await asyncio.sleep(3)
-        return True
-    except ActionError as e:
-        print(f"[WARN] Takeoff failed: {e}. Logging will continue.")
-        return False
-
-
-async def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario", default="hover", help="Scenario label for this run")
+async def main() -> int:
+    """Main flight logging coroutine."""
+    parser = argparse.ArgumentParser(
+        description="Log telemetry from PX4 SITL drone with optional takeoff.",
+        epilog="""
+Examples:
+  python3 fly_and_log.py --scenario hover --duration 60
+  python3 fly_and_log.py --scenario square --duration 120 --do-takeoff
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--scenario", default="hover", help="Scenario label for output filename"
+    )
     parser.add_argument("--run-id", default="01", help="Run identifier (e.g., 01, 02)")
-    parser.add_argument("--duration", type=float, default=60.0, help="Logging duration in seconds")
-    parser.add_argument("--rate", type=float, default=10.0, help="Logging rate (Hz)")
-    parser.add_argument("--do-takeoff", action="store_true", help="If set, try to arm + takeoff")
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=config.DEFAULT_LOGGING_DURATION_S,
+        help="Logging duration (seconds)",
+    )
+    parser.add_argument(
+        "--rate",
+        type=float,
+        default=config.DEFAULT_LOGGING_RATE_HZ,
+        help="Logging rate (Hz)",
+    )
+    parser.add_argument(
+        "--do-takeoff", action="store_true", help="Arm and takeoff before logging"
+    )
+    parser.add_argument(
+        "--debug-log-on-fail",
+        action="store_true",
+        help=(
+            "If set, still write CSV telemetry even when --do-takeoff is requested "
+            "but arm/takeoff fails."
+        ),
+    )
+    parser.add_argument(
+        "--system-address",
+        default=config.DEFAULT_SYSTEM_ADDRESS,
+        help="MAVSDK system address",
+    )
+
     args = parser.parse_args()
 
-    # Output directories
-    raw_dir = Path("data") / "normal_flights" / "raw"
+    # Validate arguments
+    try:
+        validate_args(args)
+    except ValueError as e:
+        logger.error(f"Invalid arguments: {e}")
+        parser.print_help()
+        return 1
+
+    # Setup output directory
+    raw_dir = Path(config.DEFAULT_LOG_DIR)
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    # Output CSV file
+    # Generate output filename
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_name = f"{args.scenario}_run{args.run_id}_{ts}.csv"
+    out_name = f"flight_{ts}.csv"
     out_path = raw_dir / out_name
+    out_tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+
+    logger.info(f"Scenario: {args.scenario}, Run: {args.run_id}")
+    logger.info(f"Duration: {args.duration}s, Rate: {args.rate} Hz")
+    logger.info(f"Output: {out_path}")
 
     # Connect to PX4 SITL
     drone = System()
-    await drone.connect(system_address="udpin://0.0.0.0:14030")
+    try:
+        await drone.connect(system_address=args.system_address)
+        logger.info(f"Connecting to {args.system_address}...")
+    except Exception as e:
+        logger.error(f"Failed to initiate connection: {e}", exc_info=True)
+        return 1
 
-    await wait_for_connection(drone)
+    # Wait for connection with timeout
+    try:
+        await utils.wait_for_connection(drone, verbose=True)
+    except TimeoutError as e:
+        logger.error(str(e))
+        return 1
+    except Exception as e:
+        logger.error(f"Unexpected error during connection: {e}", exc_info=True)
+        return 1
 
-    # Try to arm/takeoff if requested, but keep logging even if it fails
-    took_off = await maybe_arm_and_takeoff(drone, args.do_takeoff)
+    # Policy: only log successful flight runs (no ground-only logging).
+    if not args.do_takeoff:
+        logger.warning(
+            "Takeoff not requested (--do-takeoff not set); skipping CSV logging "
+            "because this run did not execute a flight."
+        )
+        return 1
 
-    # Shared latest telemetry snapshot
+    # Try to arm/takeoff if requested
+    took_off = await utils.maybe_arm_and_takeoff(
+        drone, args.do_takeoff, verbose=True
+    )
+    if args.do_takeoff and not took_off and not args.debug_log_on_fail:
+        logger.warning(
+            "Takeoff was requested but arm/takeoff failed; skipping CSV logging. "
+            "Use --debug-log-on-fail to capture disarmed telemetry for debugging."
+        )
+        return 1
+
+    # Initialize telemetry snapshot dict
     latest = {
         "lat_deg": None,
         "lon_deg": None,
@@ -116,32 +166,11 @@ async def main() -> None:
         "battery_voltage_v": None,
     }
 
-    async def read_position():
-        async for p in drone.telemetry.position():
-            latest["lat_deg"] = p.latitude_deg
-            latest["lon_deg"] = p.longitude_deg
-            latest["abs_alt_m"] = p.absolute_altitude_m
-            latest["rel_alt_m"] = p.relative_altitude_m
-
-    async def read_imu():
-        async for imu in drone.telemetry.imu():
-            latest["accel_x_mps2"] = imu.acceleration_frd.forward_m_s2
-            latest["accel_y_mps2"] = imu.acceleration_frd.right_m_s2
-            latest["accel_z_mps2"] = imu.acceleration_frd.down_m_s2
-            latest["gyro_x_rps"] = imu.angular_velocity_frd.forward_rad_s
-            latest["gyro_y_rps"] = imu.angular_velocity_frd.right_rad_s
-            latest["gyro_z_rps"] = imu.angular_velocity_frd.down_rad_s
-
-    async def read_battery():
-        async for b in drone.telemetry.battery():
-            latest["battery_remaining_pct"] = b.remaining_percent
-            # voltage_v may not be available in all builds
-            latest["battery_voltage_v"] = getattr(b, "voltage_v", None)
-
+    # Create background telemetry streaming tasks
     tasks = [
-        asyncio.create_task(read_position()),
-        asyncio.create_task(read_imu()),
-        asyncio.create_task(read_battery()),
+        asyncio.create_task(utils.read_position(drone, latest)),
+        asyncio.create_task(utils.read_imu(drone, latest)),
+        asyncio.create_task(utils.read_battery(drone, latest)),
     ]
 
     fieldnames = [
@@ -163,12 +192,16 @@ async def main() -> None:
         "battery_voltage_v",
     ]
 
-    print(f"Logging for {args.duration:.1f}s at {args.rate:.1f} Hz -> {out_path}")
+    # Log telemetry to a temporary CSV and only promote on full success.
+    print(f"Logging for {args.duration:.1f}s at {args.rate:.1f} Hz -> {out_tmp_path}")
     start = time.time()
     period = 1.0 / args.rate
+    row_count = 0
+    logging_ok = False
+    landing_ok = False
 
     try:
-        with out_path.open("w", newline="", encoding="utf-8") as f:
+        with out_tmp_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
 
@@ -182,22 +215,69 @@ async def main() -> None:
                     **latest,
                 }
                 writer.writerow(row)
+                row_count += 1
                 await asyncio.sleep(period)
+        logging_ok = row_count > 0
+
+    except IOError as e:
+        logger.error(f"Failed to write CSV: {e}", exc_info=True)
     finally:
+        # Gracefully shutdown telemetry tasks
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
+        # Land if we took off
         if took_off:
             print("Landing...")
             try:
                 await drone.action.land()
-                await asyncio.sleep(5)
-            except ActionError as e:
-                print(f"[WARN] Land failed: {e}")
+                landing_ok = await utils.wait_for_landed_hold_state(
+                    drone,
+                    timeout_s=max(config.SLEEP_DURING_LANDING_S, 20.0),
+                    poll_s=1.0,
+                    verbose=True,
+                )
+                if landing_ok:
+                    logger.info("Landing complete and verified.")
+            except Exception as e:
+                logger.warning(f"Land failed: {e}")
+                landing_ok = False
 
-    print("Done. Log saved.")
+    if not logging_ok:
+        logger.error("Run failed: telemetry logging did not complete successfully.")
+    if not landing_ok:
+        logger.error("Run failed: landing was not confirmed.")
+
+    csv_ok = logging_ok and utils.validate_csv_output(str(out_tmp_path), verbose=True)
+    if not csv_ok:
+        logger.error("Run failed: temporary CSV validation did not pass.")
+
+    if logging_ok and landing_ok and csv_ok:
+        try:
+            out_tmp_path.replace(out_path)
+            print(f"Logged {row_count} rows to {out_path}")
+            logger.info(f"Flight logging complete: {row_count} samples")
+            return 0
+        except Exception as e:
+            logger.error(f"Failed to promote temp CSV to final output: {e}", exc_info=True)
+
+    try:
+        if out_tmp_path.exists():
+            out_tmp_path.unlink()
+            logger.info(f"Deleted temporary CSV due to failed run: {out_tmp_path}")
+    except Exception as e:
+        logger.warning(f"Failed to delete temporary CSV {out_tmp_path}: {e}")
+    return 1
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        rc = asyncio.run(main())
+        sys.exit(rc)
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)

@@ -8,17 +8,20 @@ async def run() -> None:
 
     print("Waiting for connection...")
     start = asyncio.get_event_loop().time()
+    connected = False
     while True:
         try:
             async for state in drone.core.connection_state():
                 if state.is_connected:
                     print("Connected to drone")
-                    raise StopAsyncIteration
+                    connected = True
+                    break
         except RuntimeError as e:
             # MAVSDK can briefly report uninitialized plugins right after connect().
             if "Core plugin has not been initialized" not in str(e):
                 raise
-        except StopAsyncIteration:
+
+        if connected:
             break
 
         if asyncio.get_event_loop().time() - start > 15.0:
